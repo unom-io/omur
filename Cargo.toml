@@ -1,0 +1,23 @@
+[workspace]
+resolver = "3"
+members = ["crates/omur", "tools/probe"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/unom-io/omur"
+rust-version = "1.96"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.dependencies]
+omur = { path = "crates/omur", version = "0.1.0" }
+# The decoder every test round-trips through. Pinned: a single-maintainer, largely
+# machine-written crate; ffmpeg stays the authority (docs/design.md §9).
+oxideav-ac3 = "=0.0.11"
+oxideav-core = "=0.1.41"
+
+[profile.release]
+debug = 1

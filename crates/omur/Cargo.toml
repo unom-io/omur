@@ -1,0 +1,19 @@
+[package]
+name = "omur"
+description = "AC-3 and E-AC-3 (ATSC A/52) audio encoder in safe Rust, for real-time threads"
+keywords = ["ac3", "eac3", "audio", "codec", "encoder"]
+categories = ["multimedia::audio", "multimedia::encoding"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+oxideav-ac3.workspace = true
+oxideav-core.workspace = true
