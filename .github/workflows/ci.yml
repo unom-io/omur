@@ -24,3 +24,5 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - run: cargo clippy -p omur --all-targets --features joc -- -D warnings
+      - run: cargo test -p omur --features joc

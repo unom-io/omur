@@ -1,5 +1,5 @@
-# A `v*` tag publishes the library. Only `omur` goes to crates.io: the probe is `publish =
-# false`, and object audio stays unpublished until its release gate clears (docs/design.md §12).
+# A `v*` tag publishes the library; the probe is `publish = false`. A tag that contains
+# `src/joc` is not cut before object audio's release gate clears (docs/design.md §12).
 name: release
 on:
   push:

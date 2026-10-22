@@ -15,6 +15,8 @@
 //! # Ok(()) }
 //! ```
 //!
+//! Object audio (ETSI TS 103 420) is the [`joc`] module, behind the `joc` feature.
+//!
 //! Status: design, in `docs/design.md`. Nothing encodes yet.
 
 mod ac3;
@@ -22,6 +24,8 @@ mod bitalloc;
 mod bits;
 mod eac3;
 mod exponents;
+#[cfg(feature = "joc")]
+pub mod joc;
 mod mantissas;
 mod mdct;
 mod pack;
@@ -165,6 +169,9 @@ pub enum Error {
     Backlog,
     /// The pushed slice is not a whole number of interleaved samples.
     Length,
+    /// An object index at or past `ObjectConfig::objects`.
+    #[cfg(feature = "joc")]
+    Object { index: u8 },
 }
 
 impl fmt::Display for Error {
@@ -174,6 +181,8 @@ impl fmt::Display for Error {
             Error::Layout => f.write_str("AC-3 carries 5.1 at most"),
             Error::Backlog => f.write_str("frame ready and unread"),
             Error::Length => f.write_str("pcm length is not whole samples"),
+            #[cfg(feature = "joc")]
+            Error::Object { index } => write!(f, "object {index} is past the configured count"),
         }
     }
 }

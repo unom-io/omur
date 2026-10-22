@@ -9,6 +9,11 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# Object audio (TS 103 420). Off by default; no tag that contains src/joc is published
+# before its release gate clears (docs/design.md §12).
+joc = []
+
 [lints]
 workspace = true
 
