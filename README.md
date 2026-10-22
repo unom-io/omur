@@ -2,7 +2,8 @@
 
 An AC-3 and E-AC-3 encoder (ATSC A/52:2018) in safe Rust, built for a real-time audio
 thread: interleaved f32 at 48 kHz in, whole syncframes out, nothing allocated after
-construction. Object audio (ETSI TS 103 420) follows as a separate crate.
+construction. Object audio (ETSI TS 103 420) — a height bed plus dynamic objects — sits
+behind the `joc` feature, off by default.
 
 *ómur* is Icelandic for an echo, a faint or distant sound.
 

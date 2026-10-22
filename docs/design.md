@@ -5,7 +5,7 @@
 | **Status** | Design — nothing implemented |
 | **Date** | 2026-10-23 |
 | **Name** | Icelandic *ómur*: an echo, a faint or distant sound; from *óma*, "to resound". Alternatives: *hljómur* (sound, tone, chord) and *dynur* (din, rumble). None is a trademark; `omur`, `hljomur` and `dynur` are free on crates.io. |
-| **One line** | An AC-3 and E-AC-3 encoder (ATSC A/52:2018) in safe Rust for a real-time audio thread: interleaved f32 in, whole syncframes out, nothing allocated after construction. Object audio (ETSI TS 103 420) as a separate crate behind a release gate. |
+| **One line** | An AC-3 and E-AC-3 encoder (ATSC A/52:2018) in safe Rust for a real-time audio thread: interleaved f32 in, whole syncframes out, nothing allocated after construction. Object audio (ETSI TS 103 420) inside the crate, behind an off-by-default feature and a release gate. |
 
 [punktfunk](https://github.com/unom-io/punktfunk) streams a game host's audio as Opus. A
 Samsung TV cannot put Opus or multichannel PCM out over optical, so a soundbar behind it gets
@@ -29,7 +29,7 @@ makes it easy.
 | D8 | Block switching | **Implemented from the start**, driven by the §8.2.2 transient detector; the P1 listening pass decides whether it stays on by default. ffmpeg never uses it, and a waveform SNR on bursts cannot judge it. §6. |
 | D9 | 7.1 on E-AC-3 | **Independent substream = 5.1 with the surrounds folded; dependent substream = four channels (Ls, Rs replaced; Lrs, Rrs added).** A 5.1-only decoder plays the independent substream alone and hears everything. Verified in P2 by ffmpeg's replace-or-extend decode. §7.3. |
 | D10 | E-AC-3 tools | **None of SPX, AHT, enhanced coupling or TPNP.** The quality comes from the AC-3 core; the E-AC-3 features we need are `bsid` 16, the 1/2/3/6-block frame lengths and the substream pair. The tools can come later behind the same tests. |
-| D11 | Object audio | **A separate crate, `omur-joc`, unpublished until its patent gate clears**, built on two public hooks of `omur`: a 5.1 E-AC-3 core and a per-frame extension payload it carries in skip fields. The brief asked for a cargo feature; a published crate ships every source file whether or not a feature is on, and `cargo publish` refuses an optional dependency that is not itself published, so the crate boundary *is* the gate. §8, Q2. |
+| D11 | Object audio | **Inside the crate behind the `joc` feature, off by default; dynamic objects designed and built in full, not only beds.** The feature keeps the module out of every default build and out of punktfunk until the gate clears; because a published crate ships every source file, no tag that contains the module is published before the answer (§12). Wine delivers beds and no objects today; the object path is built against synthetic scenes so the host changes one call when Proton catches up. §8. |
 | D12 | Licence and names | **MIT OR Apache-2.0**, adapted portions keep their MIT notice. "Dolby", "Dolby Digital" and "Atmos" appear nowhere in the name, the API or a headline; the formats are AC-3 / E-AC-3 (ATSC A/52) and object audio (ETSI TS 103 420). §12. |
 | D13 | API | **`Config` (codec, layout, bitrate) validated once; `Encoder::push`/`pull`; `Frame` borrowed.** Frame size and delay are queries on `Config`, so a host sizes datagrams and A/V sync before it builds an encoder. The only E-AC-3 parameter is the frame length, because only the host knows its path MTU and latency need. §3. |
 | D14 | Toolchain | **MSRV 1.96, edition 2024, no dependencies in the library.** Dev-dependencies: `oxideav-ac3` and `oxideav-core`, pinned (§9). |
@@ -170,7 +170,7 @@ complete a second frame before the first was pulled returns `Error::Backlog` rat
 dropping or growing — the host's bug is surfaced, not buffered. There is no `flush`: a stream
 has no end, and a file tool pads its own tail with silence (the probe does).
 
-Object input lives in `omur-joc` (§8), not here.
+Object input is the `joc` module (§8.4), compiled only with the feature.
 
 ## 4. Real-time thread rules
 
@@ -343,9 +343,9 @@ Decoders are required to accept every `numblkscod`. Receivers that advertise E-A
 ARC/eARC accept `bsid` 16 with dependent substreams; the on-glass check in P2 is the
 maintainer's AVR (a Denon AVC-X3800H sits on the LAN) reporting the input as 7.1.
 
-## 8. Object audio — `omur-joc`
+## 8. Object audio — feature `joc`
 
-### 8.1 What the host captures
+### 8.1 What the host captures today
 
 The brief settles that Wine/Proton delivers spatial audio on a Linux host and asks only for
 the shape of that data. From `dlls/mmdevapi/spatialaudio.c` (upstream Wine `master`, Proton
@@ -354,80 +354,126 @@ the shape of that data. From `dlls/mmdevapi/spatialaudio.c` (upstream Wine `mast
 | | |
 |---|---|
 | Static objects (the bed) | `ActivateSpatialAudioObject(type)` for any of FL FR FC LFE SL SR BL BR TFL TFR TBL TBR BC. Mixed into one WASAPI shared-mode float render stream whose channel mask is the set the game asked for — 7.1.4 is 12 channels. The four `Bottom*` types are accepted and silently dropped. |
-| Dynamic objects | `GetMaxDynamicObjectCount` returns 0; `ActivateSpatialAudioObject(Dynamic)` returns `SPTLAUDCLNT_E_NO_MORE_OBJECTS`; `SetPosition` and `SetVolume` are `E_NOTIMPL`. There are none. |
+| Dynamic objects | `GetMaxDynamicObjectCount` returns 0; `ActivateSpatialAudioObject(Dynamic)` returns `SPTLAUDCLNT_E_NO_MORE_OBJECTS`; `SetPosition` and `SetVolume` are `E_NOTIMPL`. None yet. |
 | Position metadata | None. Bed positions are implied by the channel. |
 | Update rate | The device period: 10 ms (480 frames at 48 kHz) per `BeginUpdatingAudioObjects`. |
 | Format | 32-bit float, 48 kHz, one channel per object. |
 
-So what reaches the host is a **height bed, up to 7.1.4 (+BC), as PCM channels**, nothing
-more. That is enough for the thing a receiver calls object audio — a 7.1.4 bed carried as
-bed objects over a 5.1 core is exactly how height channels travel in E-AC-3 — and it is why
-the input API below takes beds first and objects second.
+So what reaches the host today is a **height bed, up to 7.1.4 (+BC), as PCM channels**. A
+7.1.4 bed carried as bed objects over a 5.1 core is already what a receiver calls object
+audio, so beds are the first thing the module encodes — and dynamic objects are designed in
+full below and built in the same phase, so the day Proton delivers them the host changes one
+call.
 
-Host prerequisite (Q3): the capture sink must offer a 12-channel map, or the audio server folds
-Wine's 7.1.4 stream to 7.1 before omur sees it.
+Host prerequisite (Q2): the capture sink must offer a 12-channel map, or the audio server folds
+Wine's 7.1.4 stream to 7.1 before omur sees it. A Windows host sees none of this: a game's
+objects go to Windows' own spatial engine and only its rendered mix is capturable; objects
+there would need a spatial-capable virtual endpoint, outside this crate (Q3).
 
-### 8.2 What the crate encodes
+### 8.2 What arrives once Proton adds dynamic objects
+
+The interface is fixed by `spatialaudioclient.idl`, so the shape is known before the
+implementation exists:
+
+| | |
+|---|---|
+| Count | `GetMaxDynamicObjectCount`; Windows' own spatial formats allow 16–32 per stream. The module accepts up to 32 and reduces to the stream's budget (§8.3). |
+| Signal | one mono f32 buffer per object per period (`GetBuffer`), 48 kHz, 10 ms at the default device period. |
+| Position | `SetPosition(x, y, z)` at most once per period: metres relative to the listener, right-handed, +x right, +y up, +z behind the listener. |
+| Gain | `SetVolume(v)`, linear, at most once per period. |
+| Lifetime | `ActivateSpatialAudioObject(Dynamic)` … `SetEndOfStream(frames)`; `IsActive` says whether it still produces audio; an index is reused after its end. |
+
+The host forwards, per object and chunk, the PCM and the (position, gain) pair with the
+sample at which it took effect. The crate's `ObjectUpdate` takes a listener-centred unit
+cube — +x right, +y front, +z up, each in −1..1 with 1 at the speaker wall — so the host's
+conversion from Windows is `[x, −z, y] / r` for its chosen room radius `r`: one line,
+documented beside the call.
+
+### 8.3 What the crate encodes
 
 TS 103 420 carries object audio in an E-AC-3 stream as a 5.1 core (the thing every receiver
 plays) plus, in the audio blocks' skip fields, an EMDF container (sync `0x5838`) with two
 payloads: **OAMD** (object metadata: bed assignment, positions, gains, sizes, per-update
-timing) and **JOC** (per object, per parameter band, the matrix that reconstructs the object
-from the core, with one or two data points per frame and Huffman-coded coarse or fine
+timing) and **JOC** (per element, per parameter band, the matrix that reconstructs it from
+the core, with one or two data points per frame and Huffman-coded coarse or fine
 coefficients). `addbsi` signals the extension (type A) so a receiver knows to look. A
-receiver reconstructs up to 16 objects in a 64-band QMF domain and renders them to its
+receiver reconstructs up to 16 elements in a 64-band QMF domain and renders them to its
 speakers; a 5.1 receiver plays the core and never notices.
 
 The encoder, per frame:
 
-1. **Render the core.** Bed and objects are panned to 5.1 with a fixed matrix (heights fold
-   into their floor channel at −3 dB, backs into the surrounds); the result is pushed into an
-   `omur` E-AC-3 5.1 encoder.
-2. **QMF analysis** of every object and of the rendered core (the spec's 64-band bank; the
+1. **Element budget.** A stream carries 16 elements. The bed's non-LFE channels take theirs
+   (11 for 7.1.4; the LFE goes to the core directly); dynamic objects fill the rest — five
+   with that bed, fifteen with a 2.0 bed. When the host offers more than fit, the frame's
+   loudest objects (energy × priority) keep their element and each remaining object is
+   folded into the nearest kept element by position, energy preserved, the keeper's metadata
+   unchanged — so a 32-object game still renders, with its quietest sources merged.
+2. **Render the core.** A 5.1 panner (amplitude panning over the floor ring, heights folded
+   at −3 dB) places every element; gains are interpolated sample by sample between updates so
+   a moving object leaves no clicks in the core. The core goes through an `omur` E-AC-3 5.1
+   encoder.
+3. **QMF analysis** of every element and of the rendered core (the spec's 64-band bank; the
    prototype filter is a committed table).
-3. **Matrix estimation** per data point and parameter band: the least-squares solution of
-   object ≈ matrix × core over the band's samples (a 6 × 6 solve per object and band),
-   regularised; sparse mode when one core channel dominates.
-4. **Quantise and code**: the spec's coarse/fine grids and Huffman tables; one data point for
-   smooth frames, two with a steep switch when a transient lands mid-frame; `Reuse` when the
-   matrix has not moved.
-5. **OAMD**: bed objects with their fixed positions, every frame; dynamic objects with the
-   position/gain updates the host passed, sample-offset timed.
-6. **EMDF** → bytes → `omur` carries them in the frame's skip fields and sets the extension
-   flag. The core budget is reduced by the payload (a few hundred bits per frame for a bed,
-   more with moving objects).
+4. **Matrices** per data point and parameter band: the least-squares solution of element ≈
+   matrix × core over the band's samples (a 6 × 6 solve per element and band), regularised;
+   sparse mode when one core channel dominates. One data point when nothing moved; two with
+   a steep switch at the update's timeslot when an object moved by more than a quantisation
+   step or a transient landed mid-frame; `Reuse` when the matrix is unchanged.
+5. **OAMD.** Program assignment from the bed set; per update block the timing (sample offset
+   in the frame, ramp duration to the next update) and per element the active flag, gain,
+   priority, quantised position and size, with zone constraints and screen snap off. A host
+   update every 10 ms is three or four blocks per 32 ms frame, within the syntax's limit; bed
+   elements carry their fixed position in every frame so a receiver that joins mid-stream
+   places them.
+6. **EMDF** → bytes → the core frame's skip fields, with `addbsi` signalling the extension.
+   The core budget is reduced by the payload: a few hundred bits per frame for a bed, a few
+   thousand with sixteen moving elements at two data points.
 
-Up to 16 objects: a 7.1.4 bed is 11 bed objects (LFE goes to the core directly), leaving
-five dynamic ones for the day Proton grows them.
+### 8.4 API
 
-### 8.3 API sketch
+Compiled only with `--features joc`; in `lib.rs` today as signatures.
 
 ```rust
-pub struct JocConfig { pub bed: Bed /* channel set, ≤ 7.1.4 + BC */, pub objects: u8 /* ≤ 16 − bed */, pub bitrate_kbps: u32 }
-pub struct ObjectUpdate { pub position: [f32; 3], pub gain_db: f32, pub size: f32, pub at_sample: u16 }
+pub mod joc {
+    pub enum BedChannel { FrontLeft, FrontRight, FrontCenter, Lfe, SideLeft, SideRight, BackLeft, BackRight,
+                          TopFrontLeft, TopFrontRight, TopBackLeft, TopBackRight, BackCenter }
+    pub struct Bed { /* the set; push_bed takes samples interleaved in BedChannel order */ }
+    pub const MAX_ELEMENTS: usize = 16;  // bed channels and objects together
+    pub const MAX_OBJECTS: u8 = 32;      // what a host may push; the rest fold (§8.3)
 
-pub struct ObjectEncoder { /* an omur::Encoder (E-AC-3 5.1) plus the QMF, matrices and metadata state */ }
-impl ObjectEncoder {
-    pub fn new(config: JocConfig) -> Result<ObjectEncoder, Error>;
-    pub fn push_bed(&mut self, pcm: &[f32]) -> Result<(), Error>;            // interleaved, bed order
-    pub fn push_object(&mut self, index: u8, pcm: &[f32], update: Option<ObjectUpdate>) -> Result<(), Error>;
-    pub fn pull(&mut self) -> Option<Frame<'_>>;
+    pub struct ObjectConfig { pub bed: Bed, pub objects: u8, pub bitrate_kbps: u32, pub blocks: Blocks }
+    pub struct ObjectUpdate { pub position: [f32; 3], pub gain: f32, pub size: f32, pub at_sample: u32 }
+
+    pub struct ObjectEncoder { /* an omur 5.1 E-AC-3 encoder plus QMF, matrices and metadata state */ }
+    impl ObjectEncoder {
+        pub fn new(config: ObjectConfig) -> Result<ObjectEncoder, Error>;
+        pub fn push_bed(&mut self, pcm: &[f32]) -> Result<(), Error>;
+        pub fn push_object(&mut self, index: u8, pcm: &[f32], update: Option<ObjectUpdate>) -> Result<(), Error>;
+        pub fn end_object(&mut self, index: u8);      // silent until pushed again
+        pub fn pull(&mut self) -> Option<Frame<'_>>;
+    }
 }
 ```
 
-`omur` exposes two hooks for it: a 5.1 E-AC-3 encoder, and `Encoder::set_extension(&[u8])`
-(name to settle in P3) that reserves skip-field bytes for the next frame. Both live in
-`omur`'s public API without any object code.
+One chunk is one `push_bed` plus a `push_object` per live object with the same sample count,
+then `pull`; an object not pushed in a chunk is silent for it; `at_sample` is the offset
+within the chunk at which the update took effect. §4 holds unchanged: everything is allocated
+in `new`, sized by the bed and `objects`.
 
-### 8.4 Verification and gates
+### 8.5 Verification and gates
 
-- oxideav-ac3's opt-in JOC decoder reconstructs the objects; the gate is per-object SNR
-  against the input, with the core judged by ffmpeg like any 5.1 stream.
-- On glass: the Denon reports the stream as object audio and the height speakers carry the
-  height bed.
-- Release gate: the crate is not published, and no punktfunk build enables it, until the
-  maintainer has an answer from counsel or from the rights holder on the active patent family
-  (§12).
+- oxideav-ac3's opt-in JOC decoder reconstructs the elements and parses the OAMD: per-element
+  SNR against the input, positions read back within one quantisation step; the core judged by
+  ffmpeg like any 5.1 stream.
+- Synthetic scenes, because no host delivers objects yet: a pink-noise object circling the
+  listener once every four seconds, a second one jumping between corners (steep), a speech
+  bed, and a 32-object scene that exercises the fold. `probe scene` writes them and the
+  stream.
+- On glass: the Denon reports the stream as object audio, the height speakers carry the height
+  bed, and the circling object pans across the room.
+- Release gate: no tag that contains `src/joc` is published, and no punktfunk build enables
+  `joc`, until the maintainer has an answer from counsel or from the rights holder on the
+  active patent family (§12).
 
 ## 9. Testing
 
@@ -440,7 +486,7 @@ impl ObjectEncoder {
 | Acceptance | the SNR gate of §11 per channel, at each rate, against ffmpeg's encoder on the same signal | `tools/probe` + `ffmpeg` on `PATH`; CI on Linux, skipped where absent |
 | Determinism | byte-identical output across OS and chunk size | sha256 of the probe's encode, compared across the CI matrix and across `CHUNK` sizes |
 | Real time | zero allocations in `push`/`pull`; worst-case frame time | counting allocator test; the probe reports `× realtime` and the slowest frame |
-| Fuzz | arbitrary config + arbitrary f32 (NaN, inf, huge, denormal) never panics and every frame decodes | `cargo fuzz`, two targets (`encode`, `bits`), hours before a release |
+| Fuzz | arbitrary config + arbitrary f32 (NaN, inf, huge, denormal) never panics and every frame decodes | `cargo fuzz`, three targets (`encode`, `bits`, `objects`), hours before a release |
 | Listening | pre-echo, coupling artefacts | §9.4 |
 
 Where the two decoders disagree, that is a finding, not a tie: ffmpeg is the authority and
@@ -468,7 +514,8 @@ included. Reading a stream is not reading source.
 
 `fuzz/` with `cargo fuzz`: `encode` builds a `Config` from the first bytes, pushes the rest
 as f32 in random chunk sizes and decodes every frame; `bits` drives the writer at its
-capacity edge. Crashes are fixed with a regression test; a release waits for a clean run.
+capacity edge; `objects` does the same through `ObjectEncoder` with random beds, object
+counts and updates. Crashes are fixed with a regression test; a release waits for a clean run.
 
 ### 9.4 Listening
 
@@ -491,7 +538,7 @@ omur/
     lib.rs                   Config, Encoder, Frame, Error
     tables.rs bits.rs mdct.rs exponents.rs bitalloc.rs tuner.rs mantissas.rs pack.rs
     ac3.rs eac3.rs
-  crates/omur-joc/           P3, unpublished until the gate clears
+    joc/{mod,render,qmf,matrix,oamd,emdf}.rs   feature joc, off by default (P3)
   tools/probe/src/main.rs    gen | enc | cmp | dump
   fuzz/                      P1
   .github/workflows/{ci,release}.yml
@@ -507,12 +554,13 @@ builds it on 1.96).
 |---|---|---|
 | **P1 — AC-3 5.1** | tables, bits, MDCT, exponents, allocation, tuner, mantissas, pack; 2.0 and 5.1; the probe's third encoder and `dump`; round trip, determinism, allocation and fuzz tests; `delay_samples` verified by the probe's lag | per-channel SNR on FL/FR/LFE/SL **within 1 dB of ffmpeg** at 320 and 448 kbps: ≥ 35.4 / 25.6 / 31.6 / 19.5 at 320, ≥ 39.5 / 29.5 / 34.4 / 22.2 at 448; 2.0 at 192 kbps within 1 dB of ffmpeg on FL/FR; ≥ 100× real time on one core; sha256 equal on three OSes and across chunk sizes; zero allocations after `new`; the §9.4 listening pass recorded with its verdict on block switching |
 | **P2 — E-AC-3** | `bsid` 16 syntax, `numblkscod` 0..3, the I0 + D0 pair, 7.1 channel map, the rate split; the frame-length cost table | 5.1 at six blocks matches P1's numbers (same core); 7.1 at 1,024 kbps decoded by ffmpeg to eight channels with every channel within 1 dB of the 5.1 numbers for its role, and the folded I0 alone decoding to a correct 5.1; the 1/2/3-block cost table at 448 and 640 kbps published in the README with a recommended default (expected: a length that costs ≤ 1 dB and fits 1,400 bytes at 640 kbps); the Denon shows 7.1 |
-| **P3 — object audio** | `omur-joc`: core renderer, QMF, matrix estimation, coarse/fine coding, OAMD, EMDF, skip-field injection; the 12-channel bed path end to end from a Wine game | a 7.1.4 bed reconstructed by oxideav's JOC decoder with every bed object ≥ 20 dB SNR at 768 kbps and the core within 1 dB of P2's 5.1; a receiver on glass lights up object audio and drives height speakers; the counsel/rights-holder answer on file — **no publish before it** |
-| **P4 — crates.io** | README stating what works, measured numbers and the recommended rates; docs.rs clean; `cargo publish --dry-run`; MSRV job; a clean fuzz run; `v0.1.0` | `omur` published; `omur-joc` and the probe not; punktfunk's integration task opened with the codec id and the ladder |
+| **P3 — object audio** | the `joc` module: element budget and fold, core renderer, QMF, matrix estimation, coarse/fine coding, OAMD with timed updates, EMDF, skip-field injection; beds and dynamic objects; `probe scene`; the 12-channel bed path end to end from a Wine game | a 7.1.4 bed and the synthetic scenes of §8.5 reconstructed by oxideav's JOC decoder with every element ≥ 20 dB SNR at 768 kbps, positions read back within one step, and the core within 1 dB of P2's 5.1; the 32-object scene folds without a click; a receiver on glass lights up object audio and drives height speakers; the counsel/rights-holder answer on file — **no tag with `src/joc` published before it** |
+| **P4 — crates.io** | README stating what works, measured numbers and the recommended rates; docs.rs clean; `cargo publish --dry-run`; MSRV job; a clean fuzz run; `v0.1.0` | `omur` published from a tag that either predates `src/joc` or follows the P3 answer; the probe not; punktfunk's integration task opened with the codec id and the ladder |
 
 Rough size: P1 is the bulk (tables ~1.5k lines, the pipeline ~3k, tests and the probe ~2k);
-P2 ~1.5k; P3 ~3k plus the host sink work it needs; P4 is paperwork. P1 and P2 are
-sequential; P3's crate can start once P2's hooks exist; P4 waits for P2, not P3.
+P2 ~1.5k; P3 ~4k plus the host sink work it needs; P4 is paperwork. P1 and P2 are
+sequential; P3 starts once P2's skip-field hook exists; P4 waits for P2, and for P3 only
+if the tag contains it.
 
 ## 12. Credits, licences, patents
 
@@ -529,8 +577,8 @@ sequential; P3's crate can start once P2's hooks exist; P4 waits for P2, not P3.
   left E-AC-3 out over this question.
 - Trademarks: never "Dolby", "Dolby Digital" or "Atmos" in the crate name, the API or a
   headline. "Plays on Dolby Digital receivers" in a sentence is fine.
-- Release gates: P1's SNR table and listening verdict before any tag; P3's answer before
-  `omur-joc` is published or enabled in a punktfunk build.
+- Release gates: P1's SNR table and listening verdict before any tag; no tag that contains
+  `src/joc` is published, and no punktfunk build enables `joc`, before P3's answer.
 
 ## 13. Prior art
 
@@ -552,23 +600,21 @@ sequential; P3's crate can start once P2's hooks exist; P4 waits for P2, not P3.
 
 1. **Name**: `omur` (recommended), `hljomur` or `dynur`? The skeleton says `omur`; a rename
    is a find-and-replace before the first push.
-2. **Object audio as a crate, not a feature** (D11): the brief said feature; a feature cannot
-   keep code out of a published crate. Confirm `omur-joc` as a separate, unpublished crate.
-3. **The 12-channel capture sink**: Wine renders a 7.1.4 bed as a 12-channel float stream;
+2. **The 12-channel capture sink**: Wine renders a 7.1.4 bed as a 12-channel float stream;
    unless punktfunk's capture sink (pf-audio) offers that map, the audio server folds it to
    7.1 and P3 has nothing to encode beyond 7.1. Is that sink change in scope alongside P3?
-4. **Dynamic objects**: Wine, Proton 10.0 and bleeding-edge all refuse them (§8.1). P3 ships
-   beds (heights). Should dynamic objects wait for upstream, or is a host-side Proton patch
-   something you want designed?
-5. **The bitrate ladder** (`Config::bitrates`): the proposal is 256–640 for AC-3 5.1,
+3. **Windows hosts**: a game's objects there go to Windows' spatial engine and only the
+   rendered mix is capturable; objects would need a spatial-capable virtual endpoint (an
+   APO), outside this crate. Confirm Linux/Proton is the object source for now.
+4. **The bitrate ladder** (`Config::bitrates`): the proposal is 256–640 for AC-3 5.1,
    256–1024 for E-AC-3 5.1, 640–1536 for 7.1, 128–320 for 2.0. Trim or extend before the
    host's settings bake it in?
-6. **7.1 dependent substream**: four channels with a folded I0 (D9) costs more than two but
+5. **7.1 dependent substream**: four channels with a folded I0 (D9) costs more than two but
    is safe on every receiver. Confirm, or accept 5.1 receivers losing the backs.
-7. **`dialnorm` −31 and no DRC** (D1): confirm that the host never needs loudness metadata.
-8. **Listening material and listeners** for P1's pass (§9.4): which hosts and games, and who
+6. **`dialnorm` −31 and no DRC** (D1): confirm that the host never needs loudness metadata.
+7. **Listening material and listeners** for P1's pass (§9.4): which hosts and games, and who
    besides you.
-9. **Who asks counsel**, and about what exactly: the object-coding family only, or E-AC-3
+8. **Who asks counsel**, and about what exactly: the object-coding family only, or E-AC-3
    outside the US as well, given where the host is distributed (Flathub, the App Stores).
-10. **The reference encoders in the probe**: keep oxideav and the vuio fork as permanent
-    baselines, or drop them once omur beats both?
+9. **The reference encoders in the probe**: keep oxideav and the vuio fork as permanent
+   baselines, or drop them once omur beats both?
