@@ -8,6 +8,7 @@ mod emdf;
 mod matrix;
 #[allow(dead_code)]
 mod oamd;
+#[allow(dead_code)]
 mod qmf;
 mod render;
 #[allow(dead_code)]
