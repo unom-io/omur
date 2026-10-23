@@ -984,3 +984,13 @@ pub(crate) const FINE_VEC_LEN: [u8; 192] = [
     13, 13, 12, 12, 12, 12, 11, 11, 11, 10, 10, 10,
     10, 9, 9, 9, 8, 8, 7, 7, 6, 5, 5, 3,
 ];
+/// Table A.5, a sparse band's channel index, five channels: code words.
+#[rustfmt::skip]
+pub(crate) const POS_CODE: [u32; 5] = [
+    0, 6, 5, 4, 7,
+];
+/// Table A.5, a sparse band's channel index, five channels: lengths.
+#[rustfmt::skip]
+pub(crate) const POS_LEN: [u8; 5] = [
+    1, 3, 3, 3, 3,
+];

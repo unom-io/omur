@@ -17,61 +17,94 @@ use super::tables::{FFT_IM, FFT_RE, POST_IM, POST_RE, PRE_IM, PRE_RE, QWIN};
 pub(crate) const SUBBANDS: usize = 64;
 const TAPS: usize = 640;
 
+/// The twiddles of FFT stages 4, 8 and 16 side by side: stage `h` reads `exp(-iπj/h)` for
+/// `j < h` at `h + j`.
+const STAGE_RE: [f32; 32] = stage(&FFT_RE);
+const STAGE_IM: [f32; 32] = stage(&FFT_IM);
+
+const fn stage(t: &[f32; 16]) -> [f32; 32] {
+    let mut out = [0f32; 32];
+    let mut h = 4;
+    while h < 32 {
+        let mut j = 0;
+        while j < h {
+            out[h + j] = t[j * (16 / h)];
+            j += 1;
+        }
+        h *= 2;
+    }
+    out
+}
+
+/// One radix-2 stage over butterflies `H` apart.
+#[inline(always)]
+fn butterflies<const H: usize>(re: &mut [f32; 32], im: &mut [f32; 32]) {
+    let (wr, wi) = (&STAGE_RE[H..2 * H], &STAGE_IM[H..2 * H]);
+    for (re, im) in re.chunks_exact_mut(2 * H).zip(im.chunks_exact_mut(2 * H)) {
+        let (ra, rb) = re.split_at_mut(H);
+        let (ia, ib) = im.split_at_mut(H);
+        for (((ra, rb), (ia, ib)), (wr, wi)) in ra
+            .iter_mut()
+            .zip(rb.iter_mut())
+            .zip(ia.iter_mut().zip(ib.iter_mut()))
+            .zip(wr.iter().zip(wi))
+        {
+            let tr = wr * *rb - wi * *ib;
+            let ti = wr * *ib + wi * *rb;
+            *rb = *ra - tr;
+            *ib = *ia - ti;
+            *ra += tr;
+            *ia += ti;
+        }
+    }
+}
+
 /// Radix-2 FFT, `X[k] = Σ x[n]·exp(-2πikn/32)`, on input in bit-reversed order. The
 /// first two stages' twiddles are 1 and −i, so they only add.
 fn fft32(re: &mut [f32; 32], im: &mut [f32; 32]) {
-    for b in (0..32).step_by(4) {
-        let (r0, r1, r2, r3) = (re[b], re[b + 1], re[b + 2], re[b + 3]);
-        let (i0, i1, i2, i3) = (im[b], im[b + 1], im[b + 2], im[b + 3]);
+    for (re, im) in re.chunks_exact_mut(4).zip(im.chunks_exact_mut(4)) {
+        let (r0, r1, r2, r3) = (re[0], re[1], re[2], re[3]);
+        let (i0, i1, i2, i3) = (im[0], im[1], im[2], im[3]);
         // stage 1: (0, 1) and (2, 3)
         let (a0, a1, a2, a3) = (r0 + r1, r0 - r1, r2 + r3, r2 - r3);
         let (c0, c1, c2, c3) = (i0 + i1, i0 - i1, i2 + i3, i2 - i3);
         // stage 2: (0, 2) by 1, (1, 3) by −i
-        re[b] = a0 + a2;
-        im[b] = c0 + c2;
-        re[b + 2] = a0 - a2;
-        im[b + 2] = c0 - c2;
-        re[b + 1] = a1 + c3;
-        im[b + 1] = c1 - a3;
-        re[b + 3] = a1 - c3;
-        im[b + 3] = c1 + a3;
+        re[0] = a0 + a2;
+        im[0] = c0 + c2;
+        re[2] = a0 - a2;
+        im[2] = c0 - c2;
+        re[1] = a1 + c3;
+        im[1] = c1 - a3;
+        re[3] = a1 - c3;
+        im[3] = c1 + a3;
     }
-    let mut half = 4;
-    while half < 32 {
-        let stride = 16 / half;
-        let mut base = 0;
-        while base < 32 {
-            for j in 0..half {
-                let (wr, wi) = (FFT_RE[j * stride], FFT_IM[j * stride]);
-                let (a, b) = (base + j, base + j + half);
-                let tr = wr * re[b] - wi * im[b];
-                let ti = wr * im[b] + wi * re[b];
-                re[b] = re[a] - tr;
-                im[b] = im[a] - ti;
-                re[a] += tr;
-                im[a] += ti;
-            }
-            base += 2 * half;
-        }
-        half *= 2;
-    }
+    butterflies::<4>(re, im);
+    butterflies::<8>(re, im);
+    butterflies::<16>(re, im);
 }
 
 /// The 64-point DCT-IV of `u`, unscaled: `z[n] = (u[2n] + i·u[63−2n])·exp(−iπ(4n+1)/256)`,
 /// `Z = FFT₃₂(z)`, `v[k] = Z[k]·exp(−iπk/64)`, `X[2k] = Re v[k]`, `X[63−2k] = −Im v[k]`.
 pub(crate) fn dct4(u: &[f32; 64], out: &mut [f32; 64]) {
-    let mut re = [0f32; 32];
-    let mut im = [0f32; 32];
+    let mut zr = [0f32; 32];
+    let mut zi = [0f32; 32];
     for n in 0..32 {
         let (a, b) = (u[2 * n], u[63 - 2 * n]);
+        zr[n] = a * PRE_RE[n] - b * PRE_IM[n];
+        zi[n] = b * PRE_RE[n] + a * PRE_IM[n];
+    }
+    let mut re = [0f32; 32];
+    let mut im = [0f32; 32];
+    for (n, (r, i)) in zr.iter().zip(zi).enumerate() {
         let slot = (n as u8).reverse_bits() as usize >> 3;
-        re[slot] = a * PRE_RE[n] - b * PRE_IM[n];
-        im[slot] = b * PRE_RE[n] + a * PRE_IM[n];
+        (re[slot], im[slot]) = (*r, i);
     }
     fft32(&mut re, &mut im);
+    // out[63 − 2k] is out[2m + 1] for m = 31 − k
     for k in 0..32 {
+        let m = 31 - k;
         out[2 * k] = re[k] * POST_RE[k] - im[k] * POST_IM[k];
-        out[63 - 2 * k] = -(im[k] * POST_RE[k] + re[k] * POST_IM[k]);
+        out[2 * k + 1] = -(im[m] * POST_RE[m] + re[m] * POST_IM[m]);
     }
 }
 
