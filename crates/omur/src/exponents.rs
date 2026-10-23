@@ -7,11 +7,6 @@ pub(crate) const D15: u8 = 1;
 pub(crate) const D25: u8 = 2;
 pub(crate) const D45: u8 = 3;
 
-/// A set starts afresh when its blocks' raw exponents move by more than this per bin on
-/// average from the set's first block.
-// ponytail: one fixed threshold; Stage 1b weighs exponent bits against mantissa bits.
-const NEW_SET_PER_BIN: u32 = 2;
-
 /// The most 7-bit groups a channel sends: D15 over 253 bins.
 pub(crate) const MAX_GROUPS: usize = 84;
 
@@ -63,10 +58,20 @@ pub(crate) fn group_count(strategy: u8, start: usize, end: usize) -> usize {
     }
 }
 
-/// The strategy of each block: a fresh set where the raw exponents moved, sized by how many
-/// blocks it covers (one: D45, two or three: D25, more: D15, §8.2.8); reuse elsewhere.
-/// Block 0 always starts a set.
-pub(crate) fn plan(raw: &[[u8; 256]; 6], start: usize, end: usize) -> [u8; 6] {
+/// The strategy of each block. A block starts a fresh set when its raw exponents have moved
+/// from the set's first block by more exponent steps, summed over the bins, than a fresh D15
+/// set costs in bits (`fixed` plus its groups): a bin's mantissa takes about a bit more for
+/// each step its envelope sits under it. Each set is sized by how many blocks it covers
+/// (one: D45, two or three: D25, more: D15, §8.2.8), the 32 splits of six blocks ffmpeg's
+/// streams use; D15 or reuse only where `d15_only` (the LFE). Block 0 always starts a set.
+pub(crate) fn plan(
+    raw: &[[u8; 256]; 6],
+    start: usize,
+    end: usize,
+    fixed: u32,
+    d15_only: bool,
+) -> [u8; 6] {
+    let price = fixed + 7 * group_count(D15, start, end) as u32;
     let mut fresh = [false; 6];
     fresh[0] = true;
     let mut first = 0;
@@ -76,7 +81,7 @@ pub(crate) fn plan(raw: &[[u8; 256]; 6], start: usize, end: usize) -> [u8; 6] {
             .zip(&raw[b][start..end])
             .map(|(a, c)| u32::from(a.abs_diff(*c)))
             .sum();
-        if moved > NEW_SET_PER_BIN * (end - start) as u32 {
+        if moved > price {
             fresh[b] = true;
             first = b;
         }
@@ -86,6 +91,7 @@ pub(crate) fn plan(raw: &[[u8; 256]; 6], start: usize, end: usize) -> [u8; 6] {
     while b < 6 {
         let len = 1 + fresh[b + 1..].iter().take_while(|s| !**s).count();
         out[b] = match len {
+            _ if d15_only => D15,
             1 => D45,
             2 | 3 => D25,
             _ => D15,
@@ -222,12 +228,35 @@ mod tests {
     }
 
     #[test]
-    fn plan_sizes_each_set_by_its_reach() {
+    fn plan_weighs_exponent_bits_against_mantissa_bits() {
         let mut raw = [[10u8; 256]; 6];
-        assert_eq!(plan(&raw, 0, 100), [D15, REUSE, REUSE, REUSE, REUSE, REUSE]);
+        assert_eq!(
+            plan(&raw, 0, 100, 6, false),
+            [D15, REUSE, REUSE, REUSE, REUSE, REUSE]
+        );
+        // 100 bins two steps quieter: 200 bits, less than a set's 237
+        raw[3..].fill([12; 256]);
+        assert_eq!(plan(&raw, 0, 100, 6, false)[1..], [REUSE; 5]);
         raw[3..].fill([20; 256]);
-        assert_eq!(plan(&raw, 0, 100), [D25, REUSE, REUSE, D25, REUSE, REUSE]);
+        assert_eq!(
+            plan(&raw, 0, 100, 6, false),
+            [D25, REUSE, REUSE, D25, REUSE, REUSE]
+        );
         raw[4] = [0; 256];
-        assert_eq!(plan(&raw, 0, 100), [D25, REUSE, REUSE, D45, D45, D45]);
+        assert_eq!(
+            plan(&raw, 0, 100, 6, false),
+            [D25, REUSE, REUSE, D45, D45, D45]
+        );
+        assert_eq!(
+            plan(&raw, 0, 7, 4, true),
+            [D15, REUSE, REUSE, D15, D15, D15]
+        );
+        // a coupling channel from bin 133: 36 bins a step apart cost less than its 88 bits
+        let mut cpl = [[24u8; 256]; 6];
+        cpl.iter_mut().for_each(|b| b[133..169].fill(8));
+        cpl[1][133..169].fill(9);
+        assert_eq!(plan(&cpl, 133, 169, 4, false)[1..], [REUSE; 5]);
+        cpl[1][133..169].fill(11);
+        assert_eq!(plan(&cpl, 133, 169, 4, false)[..2], [D45, D45]);
     }
 }

@@ -5,7 +5,7 @@ pub(crate) mod coupling;
 
 use crate::bitalloc::{Alloc, MAX_SLOTS, Offsets, curve};
 use crate::bits::{BitWriter, Overflow, crc_shift_back};
-use crate::exponents::{D15, Groups, REUSE, encode, extract, plan};
+use crate::exponents::{Groups, REUSE, encode, extract, plan};
 use crate::mantissas::Mantissas;
 use crate::pack::{self, Side, Stream};
 use crate::tables::BITRATES;
@@ -35,24 +35,21 @@ fn transform(pcm: &[f32; SPAN], blksw: &[bool; 6], coef: &mut [[f32; 256]; 6]) {
 
 /// One slot's frame up to the SNR offsets: raw exponents, the exponent sets and their
 /// masking curves over `alloc.start..alloc.end`. A set covers the blocks up to the next
-/// that sends one, with each bin's smallest exponent over them.
+/// that sends one, with each bin's smallest exponent over them; `fixed` is the bits a set
+/// sends besides its groups.
 fn envelope(
     coef: &[[f32; 256]; 6],
     raw: &mut [[u8; 256]; 6],
     side: &mut Side,
     alloc: &mut Alloc,
+    fixed: u32,
     lfe: bool,
 ) {
     let (start, end) = (alloc.start, alloc.end);
     for (c, r) in coef.iter().zip(raw.iter_mut()) {
         extract(c, end, r);
     }
-    side.strategy = plan(raw, start, end);
-    if lfe {
-        for st in side.strategy.iter_mut().filter(|st| **st != REUSE) {
-            *st = D15;
-        }
-    }
+    side.strategy = plan(raw, start, end, fixed, lfe);
     let mut b = 0;
     while b < 6 {
         let len = 1 + side.strategy[b + 1..]
@@ -214,11 +211,18 @@ impl Ac3 {
         }
         let slots = s.slots();
         for c in 0..slots {
+            // absexp, then gainrng and chbwcod where sent
+            let fixed = match c {
+                _ if c >= nf => 4,
+                _ if s.cpl.is_some() => 6,
+                _ => 12,
+            };
             envelope(
                 &self.coef[c],
                 &mut self.raw[c],
                 &mut self.side[c],
                 &mut self.alloc[c],
+                fixed,
                 Some(c) == s.lfe_slot(),
             );
         }
