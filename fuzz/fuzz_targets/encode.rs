@@ -1,5 +1,5 @@
 //! Any AC-3 config, any push schedule, hostile f32: every frame is a whole syncframe that
-//! oxideav-ac3 checks, parses and decodes to finite audio near full scale.
+//! oxideav-ac3 checks, parses and decodes to finite audio no louder than dither allows.
 
 #![no_main]
 
@@ -39,11 +39,31 @@ fn run(u: &mut Unstructured) -> arbitrary::Result<()> {
         let got = (b.bsid, b.acmod, b.lfeon, b.dialnorm);
         assert_eq!(got, (8, acmod, lfeon, 31), "bsi of frame {k}");
         audblk::decode_frame(&mut state, &si, &b, f, &mut out).expect("decode");
-        // Input clamped to ±1.0 and coded with 3-level quantisers overshoots the rail by
-        // tens of percent on a square wave; the bound catches garbage, not that.
-        if let Some(s) = out.iter().find(|s| !s.is_finite() || s.abs() > 2.0) {
-            panic!("frame {k} decodes to {s}");
-        }
+        // Dither fills every masked bin at its exponent's level, so a hostile input can
+        // decode louder than itself; garbage from a misread frame is louder by orders of
+        // magnitude. Frame k holds input samples 1536k on: the stream adds no delay.
+        let ch = config.layout().channels();
+        let frame_in = &pcm[k * 1536 * ch..(k + 1) * 1536 * ch];
+        let rms_in = (frame_in
+            .iter()
+            .map(|s| {
+                let c = if s.is_finite() {
+                    s.clamp(-1.0, 1.0)
+                } else {
+                    0.0
+                };
+                f64::from(c) * f64::from(c)
+            })
+            .sum::<f64>()
+            / frame_in.len() as f64)
+            .sqrt();
+        let rms_out =
+            (out.iter().map(|s| f64::from(*s).powi(2)).sum::<f64>() / out.len() as f64).sqrt();
+        let peak = out.iter().fold(0f32, |m, s| m.max(s.abs()));
+        assert!(
+            out.iter().all(|s| s.is_finite()) && peak <= 64.0 && rms_out <= 4.0 * rms_in + 0.05,
+            "frame {k} decodes to rms {rms_out:.3} (input {rms_in:.3}), peak {peak:.3}"
+        );
     }
     Ok(())
 }
