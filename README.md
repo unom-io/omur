@@ -99,8 +99,9 @@ and rebuilt from the core by the reference decoder's parsers: bed channels at 61
 height channels at 41 dB, two moving pink-noise objects at 25 dB (the core's own ceiling on
 pink noise), 32 objects folded into 16 elements at 24–36 dB; every position reads back
 within one quantisation step. The core costs 0.1 dB (bed) to 0.6 dB (five moving objects)
-against plain 5.1 at the same rate. Speed: 221× for two objects, 132× for a bed, 93× for a
-bed with five objects, 73× for 32. A receiver has not played it yet.
+against plain 5.1 at the same rate. Speed: 311× for two objects, 175× for a 7.1.4 bed,
+122× for the bed with five objects, 96× for 32 objects; slowest chunk 189 µs. A receiver
+has not played it yet.
 
 ## Why
 
