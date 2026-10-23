@@ -10,6 +10,7 @@ mod matrix;
 mod oamd;
 #[allow(dead_code)]
 mod qmf;
+#[allow(dead_code)]
 mod render;
 #[allow(dead_code)]
 mod tables;
@@ -41,6 +42,25 @@ pub enum BedChannel {
     TopBackLeft,
     TopBackRight,
     BackCenter,
+}
+
+impl BedChannel {
+    /// Every channel, in the order `push_bed` interleaves them.
+    pub const ALL: [BedChannel; 13] = [
+        BedChannel::FrontLeft,
+        BedChannel::FrontRight,
+        BedChannel::FrontCenter,
+        BedChannel::Lfe,
+        BedChannel::SideLeft,
+        BedChannel::SideRight,
+        BedChannel::BackLeft,
+        BedChannel::BackRight,
+        BedChannel::TopFrontLeft,
+        BedChannel::TopFrontRight,
+        BedChannel::TopBackLeft,
+        BedChannel::TopBackRight,
+        BedChannel::BackCenter,
+    ];
 }
 
 /// The bed's channel set. [`ObjectEncoder::push_bed`] takes samples interleaved in
