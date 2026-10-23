@@ -48,6 +48,73 @@ pub fn signal(layout: Layout, frames: usize) -> Vec<f32> {
     out
 }
 
+/// A tone as the recurrence `s[n] = k·s[n−1] − s[n−2]`, `k = 2·cos ω`, started at
+/// `s[1] = A·sin ω`: a sine with no libm call, so every platform computes the same bits.
+struct Tone {
+    k: f32,
+    s1: f32,
+    s2: f32,
+}
+
+impl Tone {
+    fn new(k: f32, s1: f32) -> Tone {
+        Tone { k, s1, s2: 0.0 }
+    }
+
+    fn next(&mut self) -> f32 {
+        let s = self.k * self.s1 - self.s2;
+        self.s2 = self.s1;
+        self.s1 = s;
+        self.s2
+    }
+}
+
+/// `signal`'s tones and noise, from constants alone: byte-identical on every platform, so
+/// the golden hashes hold on every CI runner. 7.1's seventh channel is a plain 3 kHz tone.
+pub fn pinned_signal(layout: Layout, frames: usize) -> Vec<f32> {
+    let ch = layout.channels();
+    let mut tones: [Vec<Tone>; 8] = [
+        vec![
+            Tone::new(1.9966836, 0.017269207),
+            Tone::new(1.9702187, 0.01719291),
+        ],
+        vec![
+            Tone::new(1.9925407, 0.02588591),
+            Tone::new(1.8162863, 0.020932987),
+        ],
+        vec![
+            Tone::new(1.9989291, 0.008179771),
+            Tone::new(1.9318516, 0.020705523),
+        ],
+        vec![Tone::new(1.9999572, 0.0026179752)],
+        vec![
+            Tone::new(1.9867455, 0.02298743),
+            Tone::new(1.5867066, 0.018262843),
+        ],
+        vec![],
+        vec![Tone::new(1.847759, 0.076536685)],
+        vec![
+            Tone::new(1.9793028, 0.035873156),
+            Tone::new(1.2175229, 0.015867068),
+        ],
+    ];
+    let mut seed = 0x9e37_79b9u32;
+    let mut out = Vec::with_capacity(frames * ch);
+    for _ in 0..frames {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let noise = (seed >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0;
+        for (c, t) in tones.iter_mut().enumerate().take(ch) {
+            let v = if c == 5 {
+                0.2 * noise
+            } else {
+                t.iter_mut().map(Tone::next).sum()
+            };
+            out.push(v);
+        }
+    }
+    out
+}
+
 /// Pushes `pcm` in `chunk`-sample pushes, pulling after each; a refused push is split in
 /// two and retried. Returns the frames with their pts.
 pub fn encode(config: Config, pcm: &[f32], chunk: usize) -> Vec<(u64, Vec<u8>)> {
