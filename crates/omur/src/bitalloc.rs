@@ -8,12 +8,15 @@ use crate::tables::{
     SLOWGAIN,
 };
 
-/// The parametric model's codes, fixed for the stream: the basic encoder's (§8.2.12).
+/// The parametric model's codes, fixed for the stream: the basic encoder's (§8.2.12) with
+/// the knee at `dbpbcod` 3 and no masking floor (`floorcod` 7), the values ffmpeg's streams
+/// carry at every rate. A higher knee lifts the mask of all but the loudest bands, which
+/// moves bits towards the peaks.
 pub(crate) const SDCYCOD: u8 = 2;
 pub(crate) const FDCYCOD: u8 = 1;
 pub(crate) const SGAINCOD: u8 = 1;
-pub(crate) const DBPBCOD: u8 = 2;
-pub(crate) const FLOORCOD: u8 = 4;
+pub(crate) const DBPBCOD: u8 = 3;
+pub(crate) const FLOORCOD: u8 = 7;
 pub(crate) const FGAINCOD: u8 = 4;
 
 /// Bins a band-indexed loop may touch: the highest `endmant` (chbwcod 60).
