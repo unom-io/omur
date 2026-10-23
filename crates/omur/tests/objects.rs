@@ -280,6 +280,61 @@ fn pinned_jumps(n: usize) -> Scene {
     }
 }
 
+/// A 7.1.4 bed of steady tones, each channel's in a QMF band of its own with an empty one
+/// between, and five tones in high bands on `scene`'s square path: in most bands one core
+/// channel carries the element, which sparse frames code.
+fn pinned_bands(n: usize) -> Scene {
+    let voices = [
+        (1.9945809, 0.011034684),
+        (1.9705553, 0.025644284),
+        (1.9275521, 0.040006913),
+        (1.9999726, 0.0015707891),
+        (1.8659856, 0.053984255),
+        (1.7864486, 0.0674417),
+        (1.6897072, 0.080249645),
+        (1.5766928, 0.09228474),
+        (1.4484942, 0.10343108),
+        (1.3063457, 0.11358133),
+        (1.1516163, 0.12263772),
+        (0.9857964, 0.13051304),
+    ]
+    .map(|(k, s)| sine(k, s, n));
+    let bed_pcm = (0..n * 12).map(|i| voices[i % 12][i / 12]).collect();
+    let obj = [
+        (0.7197901, 0.09329928),
+        (0.14712913, 0.099729046),
+        (-0.43820247, 0.09757021),
+        (-0.9857964, 0.0870087),
+        (-1.4484942, 0.06895406),
+    ]
+    .iter()
+    .map(|(k, s)| sine(*k, *s, n))
+    .collect();
+    let updates = (0..5)
+        .map(|o| {
+            (0..n)
+                .step_by(480)
+                .map(|i| {
+                    let t = ((i / 480 + 7 * o) % 64) as f32 / 16.0 - 2.0;
+                    let u = ObjectUpdate {
+                        position: [t.clamp(-1.0, 1.0), (-t).clamp(-1.0, 1.0), 0.25 * o as f32],
+                        gain: 1.0,
+                        size: 0.0,
+                        at_sample: 0,
+                    };
+                    (i + 100, u)
+                })
+                .collect()
+        })
+        .collect();
+    Scene {
+        bed: bed_714(),
+        bed_pcm,
+        obj,
+        updates,
+    }
+}
+
 /// FNV-1a, 64 bits.
 fn fnv1a(bytes: impl IntoIterator<Item = u8>) -> u64 {
     bytes.into_iter().fold(0xcbf2_9ce4_8422_2325, |h, b| {
@@ -445,6 +500,7 @@ fn object_output_is_unchanged() {
         ("mix", pinned_mix(12 * FRAME), 0x0f28_181f_1af8_7abfu64),
         ("crowd", pinned_crowd(8 * FRAME), 0x1548_9232_7be0_22c6),
         ("jumps", pinned_jumps(8 * FRAME), 0xf3c8_94b5_b2aa_fefd),
+        ("bands", pinned_bands(12 * FRAME), 0x3f7d_f296_f481_c27d),
     ];
     for (name, s, want) in cases {
         let got = fnv1a(encode(&s, 768, 240).concat());
