@@ -22,3 +22,10 @@ workspace = true
 [dev-dependencies]
 oxideav-ac3.workspace = true
 oxideav-core.workspace = true
+# Counts allocations for tests/realtime.rs; implementing GlobalAlloc ourselves needs `unsafe`.
+stats_alloc = "=0.1.10"
+
+# A counting global allocator needs the binary to itself.
+[[test]]
+name = "realtime"
+harness = false
