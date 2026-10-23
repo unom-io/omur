@@ -8,6 +8,8 @@ mod matrix;
 mod oamd;
 mod qmf;
 mod render;
+#[allow(dead_code)]
+mod tables;
 
 use crate::{Blocks, Codec, Config, Error, Frame, Layout};
 
