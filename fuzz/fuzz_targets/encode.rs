@@ -39,11 +39,14 @@ fn run(u: &mut Unstructured) -> arbitrary::Result<()> {
         let got = (b.bsid, b.acmod, b.lfeon, b.dialnorm);
         assert_eq!(got, (8, acmod, lfeon, 31), "bsi of frame {k}");
         audblk::decode_frame(&mut state, &si, &b, f, &mut out).expect("decode");
-        // Dither fills every masked bin at its exponent's level, so a hostile input can
-        // decode louder than itself; garbage from a misread frame is louder by orders of
-        // magnitude. Frame k holds input samples 1536k on: the stream adds no delay.
+        // Dither fills every masked bin at its exponent's level, and a block's noise spreads
+        // over its whole 512-sample window, so a hostile input can decode louder than itself;
+        // garbage from a misread frame is louder by orders of magnitude. Frame k holds input
+        // samples 1536k on (the stream adds no delay); its windows reach 256 either side.
         let ch = config.layout().channels();
-        let frame_in = &pcm[k * 1536 * ch..(k + 1) * 1536 * ch];
+        let lo = (k * 1536).saturating_sub(256) * ch;
+        let hi = (((k + 1) * 1536 + 256) * ch).min(pcm.len());
+        let frame_in = &pcm[lo..hi];
         let rms_in = (frame_in
             .iter()
             .map(|s| {
