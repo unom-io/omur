@@ -161,7 +161,11 @@ pub fn ffmpeg_decodes(stream: &[u8], name: &str) {
         .output();
     let _ = std::fs::remove_file(&path);
     if let Ok(out) = out {
-        assert!(out.status.success(), "{name}");
-        assert_eq!(String::from_utf8_lossy(&out.stderr), "", "{name}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success() && stderr.is_empty(),
+            "{name}: ffmpeg {}: {stderr}",
+            out.status
+        );
     }
 }
