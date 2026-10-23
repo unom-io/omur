@@ -199,7 +199,7 @@ pub(crate) fn curve(
     if start >= end {
         return;
     }
-    for (p, e) in psd.iter_mut().zip(exp).take(end).skip(start) {
+    for (p, e) in psd[start..end].iter_mut().zip(&exp[start..end]) {
         *p = (3072 - (i32::from(*e) << 7)) as i16;
     }
     let mut bin = start;
@@ -304,8 +304,8 @@ pub(crate) fn for_each_address(
     while bin < end {
         let last = (BNDTAB[band] as usize + BNDSZ[band] as usize).min(end);
         let m = ((i32::from(mask[band]) - offset - floor).max(0) & 0x1fe0) + floor;
-        for (i, p) in psd.iter().enumerate().take(last).skip(bin) {
-            f(i, ((i32::from(*p) - m) >> 5).clamp(0, 63) as usize);
+        for (i, p) in psd.get(bin..last).unwrap_or_default().iter().enumerate() {
+            f(bin + i, ((i32::from(*p) - m) >> 5).clamp(0, 63) as usize);
         }
         bin = last;
         band += 1;
