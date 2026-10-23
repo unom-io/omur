@@ -145,3 +145,57 @@ fn output_does_not_depend_on_the_chunking() {
         }
     }
 }
+
+/// The bytes `set_extension` hands over come back, in order, from the skip fields of the
+/// frame after it, which still decodes; AC-3 and an oversized payload are refused.
+#[test]
+fn extensions_ride_the_next_frames_skip_fields() {
+    use omur::{Encoder, Error};
+    use oxideav_ac3::audblk::Ac3State;
+    use oxideav_ac3::eac3::dsp;
+
+    let mut ac3 = Encoder::new(Config::new(Codec::Ac3, Layout::Surround51, 448).unwrap()).unwrap();
+    assert_eq!(ac3.set_extension(&[1]), Err(Error::Length));
+    for (blocks, kbps, sizes) in [
+        (Blocks::Six, 640, &[5, 511, 512, 1200, 0][..]),
+        (Blocks::One, 448, &[1, 37, 100][..]),
+        (Blocks::Three, 1024, &[1, 1022, 1023, 3][..]),
+    ] {
+        let config = Config::new(eac3(blocks), Layout::Surround51, kbps).unwrap();
+        let mut enc = Encoder::new(config).unwrap();
+        assert_eq!(enc.set_extension(&[0; 5000]), Err(Error::Length));
+        let pcm = signal(Layout::Surround51, 8 * 1536);
+        let mut want = vec![vec![]];
+        let mut frames = vec![];
+        for chunk in pcm.chunks(6 * 240) {
+            enc.push(chunk).unwrap();
+            if let Some(f) = enc.pull() {
+                frames.push(f.bytes.to_vec());
+                let k = frames.len();
+                let payload: Vec<u8> = (0..sizes[k % sizes.len()])
+                    .map(|i| (i * 7 + k) as u8)
+                    .collect();
+                enc.set_extension(&payload).unwrap();
+                want.push(payload);
+            }
+        }
+        let mut state = decoder::Eac3DecoderState::default();
+        for (k, f) in frames.iter().enumerate() {
+            let what = format!("{blocks:?} {kbps} frame {k}");
+            let b = bsi::parse(&f[2..]).unwrap();
+            let mut br = BitReader::new(&f[2..]);
+            br.skip(b.bits_consumed as u32).unwrap();
+            let a = audfrm::parse_with(&mut br, &b).unwrap();
+            let mut out = vec![0f32; blocks.count() * 256 * 6];
+            let mut skips = vec![];
+            dsp::decode_indep_audblks(&b, &a, &mut br, &mut Ac3State::new(), &mut out, &mut skips)
+                .unwrap();
+            assert_eq!(skips.concat(), want[k], "{what}");
+            assert!(skips.iter().all(|s| s.len() <= 511), "{what}");
+            decoder::decode_eac3_packet(&mut state, f).unwrap();
+            assert_eq!(state.frames_zero_filled, 0, "{what}");
+            assert!(verify_packet_crc(f).unwrap().all_ok(), "{what}");
+        }
+        ffmpeg_decodes(&frames.concat(), &format!("ext-{blocks:?}-{kbps}"));
+    }
+}

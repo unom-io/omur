@@ -188,7 +188,8 @@ pub enum Error {
     Layout,
     /// A frame completed while the previous one was still unread. Pull after every push.
     Backlog,
-    /// The pushed slice is not a whole number of interleaved samples.
+    /// The pushed slice is not a whole number of interleaved samples, or an extension does
+    /// not fit the stream's frames.
     Length,
     /// An object index at or past `ObjectConfig::objects`.
     #[cfg(feature = "joc")]
@@ -201,7 +202,7 @@ impl fmt::Display for Error {
             Error::Bitrate { kbps } => write!(f, "bitrate {kbps} kbit/s not in the ladder"),
             Error::Layout => f.write_str("AC-3 carries 5.1 at most"),
             Error::Backlog => f.write_str("frame ready and unread"),
-            Error::Length => f.write_str("pcm length is not whole samples"),
+            Error::Length => f.write_str("pcm is not whole samples, or extension too long"),
             #[cfg(feature = "joc")]
             Error::Object { index } => write!(f, "object {index} is past the configured count"),
         }
@@ -316,6 +317,18 @@ impl Encoder {
             }
         }
         Ok(())
+    }
+
+    /// Carries `bytes` in the skip fields of the next frame a `push` completes, spread over
+    /// its blocks in order: the hook for object audio's container (docs/design.md §8.3).
+    /// The frame's mantissas get what is left. A second call before that frame replaces
+    /// the first. E-AC-3 2.0 and 5.1 only: [`Error::Length`] on AC-3 or 7.1, or when
+    /// `bytes` passes what the stream's busiest frame leaves free.
+    pub fn set_extension(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        match (self.config.codec, self.config.layout) {
+            (Codec::Ac3, _) | (_, Layout::Surround71) => Err(Error::Length),
+            _ => self.core.set_extension(bytes),
+        }
     }
 
     /// The frame the last `push` completed, once.

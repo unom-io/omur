@@ -7,7 +7,7 @@ mod transient;
 
 use crate::bitalloc::{Alloc, MAX_SLOTS, Offsets, curve};
 use crate::bits::{BitWriter, Overflow};
-use crate::exponents::{Groups, REUSE, encode, extract, plan};
+use crate::exponents::{D15, D45, Groups, REUSE, encode, extract, group_count, plan};
 use crate::mantissas::Mantissas;
 use crate::pack::{self, Choices, Side, Stream, Syntax};
 use crate::tuner::{self, Budget};
@@ -24,6 +24,15 @@ pub(crate) const SPAN: usize = 6 * BLOCK_SAMPLES + BLOCK_SAMPLES;
 
 /// `endmant` of the LFE (§7.1.3).
 const LFE_END: usize = 7;
+
+/// Bytes one skip field holds (`skipl`).
+const SKIP_BYTES: usize = 511;
+
+/// Block `b`'s share of `ext`: its next `SKIP_BYTES`, or nothing past the end.
+fn skip_of(ext: &[u8], b: usize) -> Option<&[u8]> {
+    let chunk = ext.get(SKIP_BYTES * b..ext.len().min(SKIP_BYTES * (b + 1)))?;
+    (!chunk.is_empty()).then_some(chunk)
+}
 
 /// The first `blocks` blocks' transforms of one channel: one 512-point or a short pair each.
 fn transform(pcm: &[f32; SPAN], blksw: &[bool; 6], coef: &mut [[f32; 256]; 6], blocks: usize) {
@@ -197,6 +206,13 @@ pub(crate) struct Ac3 {
     hint: u32,
     /// Blocks from the start of the six-block group to this frame's first.
     group: usize,
+    /// What the next frame carries in its skip fields, `ext_len` bytes of it, spread over
+    /// the blocks in order; E-AC-3 only.
+    ext: Box<[u8]>,
+    ext_len: usize,
+    /// The most `ext_len` may be: what a frame whose every block sends fresh exponents
+    /// and coordinates leaves.
+    ext_room: usize,
     transients: transient::Detector,
     /// Bits through block 1 of the last frame, which crc1 must cover.
     #[cfg(test)]
@@ -237,7 +253,8 @@ impl Ac3 {
             None => (0, 37 + 3 * (usize::from(chbwcod) + 12)),
         };
         let slots = stream.slots();
-        Ac3 {
+        let eac3 = stream.eac3();
+        let mut core = Ac3 {
             stream,
             pcm: vec![[0.0; SPAN]; nch].into_boxed_slice(),
             coef: vec![[[0.0; 256]; 6]; slots].into_boxed_slice(),
@@ -259,6 +276,9 @@ impl Ac3 {
             remat: [false; 4],
             hint: 0,
             group: 0,
+            ext: vec![0; if eac3 { SKIP_BYTES * blocks } else { 0 }].into_boxed_slice(),
+            ext_len: 0,
+            ext_room: 0,
             transients: transient::Detector::default(),
             #[cfg(test)]
             first_bits: 0,
@@ -266,7 +286,49 @@ impl Ac3 {
             last_start: 0,
             #[cfg(test)]
             fallbacks: 0,
+        };
+        if eac3 {
+            core.ext_room = core.room();
         }
+        core
+    }
+
+    /// Skip-field bytes every frame holds whatever its audio: the bits past the side
+    /// information of every block sending fresh exponents (D45, the LFE D15: the most a
+    /// set costs per block it covers) and coordinates, less 9 bits of `skipl` per block.
+    fn room(&mut self) -> usize {
+        let n = self.stream.blocks;
+        let lfe = self.stream.lfe_slot();
+        for (c, side) in self.side.iter_mut().enumerate() {
+            let strategy = if Some(c) == lfe { D15 } else { D45 };
+            side.strategy = [strategy; 6];
+            for g in side.groups.iter_mut() {
+                g.count = group_count(strategy, side.start, side.end);
+            }
+        }
+        if let Some(f) = self.coupling.as_deref_mut() {
+            f.send = [[true; coupling::MAX_FBW]; 6];
+        }
+        let mut scratch = vec![0u8; self.stream.frame_bytes];
+        let Ok(budget) = self.size(&mut scratch) else {
+            return 0;
+        };
+        let used = budget.header + budget.side.iter().sum::<u32>() + budget.trailer + 9 * n as u32;
+        let left = budget.frame.saturating_sub(used) as usize / 8;
+        left.min(self.ext.len())
+    }
+
+    /// Carries `bytes` in the next frame's skip fields, spread over its blocks in order.
+    /// Refuses more than any frame of the stream can hold.
+    pub(crate) fn set_extension(&mut self, bytes: &[u8]) -> Result<(), crate::Error> {
+        let dst = self
+            .ext
+            .get_mut(..bytes.len())
+            .filter(|_| bytes.len() <= self.ext_room)
+            .ok_or(crate::Error::Length)?;
+        dst.copy_from_slice(bytes);
+        self.ext_len = bytes.len();
+        Ok(())
     }
 
     pub(crate) fn frame_bytes(&self) -> usize {
@@ -293,24 +355,24 @@ impl Ac3 {
         self.group = (self.group + n) % 6;
     }
 
-    /// Encodes the frame in `pcm` into `out`, `frame_bytes` long. A frame the tuner's
-    /// offsets do not fit goes out at the all-zero offsets instead: every `bap` 0, no
-    /// mantissas, which every rate holds.
+    /// Encodes the frame in `pcm` into `out`, `frame_bytes` long, with the extension set
+    /// for it. A frame the tuner's offsets do not fit goes out at the all-zero offsets
+    /// instead: every `bap` 0, no mantissas, which every rate holds.
     pub(crate) fn encode(&mut self, out: &mut [u8]) {
         self.analyse();
-        let Ok(budget) = self.size(out) else {
-            return;
-        };
-        let shared = self.stream.eac3();
-        let tuned = tuner::tune(&self.alloc, &budget, &mut self.hint, shared);
-        let written = tuned.map(|off| self.write(out, &budget, &off));
-        if !matches!(written, Some(Ok(()))) {
-            let _ = self.write(out, &budget, &Offsets::default());
-            #[cfg(test)]
-            {
-                self.fallbacks += 1;
+        if let Ok(budget) = self.size(out) {
+            let shared = self.stream.eac3();
+            let tuned = tuner::tune(&self.alloc, &budget, &mut self.hint, shared);
+            let written = tuned.map(|off| self.write(out, &budget, &off));
+            if !matches!(written, Some(Ok(()))) {
+                let _ = self.write(out, &budget, &Offsets::default());
+                #[cfg(test)]
+                {
+                    self.fallbacks += 1;
+                }
             }
         }
+        self.ext_len = 0;
     }
 
     /// Everything up to the SNR offsets: transforms, the coupling channel, exponents and
@@ -388,10 +450,11 @@ impl Ac3 {
         let mut w = BitWriter::new(out);
         self.header(&mut w, &Offsets::default())?;
         budget.header = w.position() as u32;
+        let ext = &self.ext[..self.ext_len];
         for b in 0..s.blocks {
             let at = w.position();
             let off = Offsets::default();
-            pack::block_side(&mut w, s, &self.side, choices, &off, b, None)?;
+            pack::block_side(&mut w, s, &self.side, choices, &off, b, skip_of(ext, b))?;
             budget.side[b] = (w.position() - at) as u32;
         }
         Ok(budget)
@@ -406,18 +469,20 @@ impl Ac3 {
         };
         tuner::fill(&mut self.alloc, off);
         let mant = tuner::mantissa_bits(&self.alloc, off);
-        let skips = budget.first.map_or([None; 6], |first| {
+        let pad = budget.first.map_or([None; 6], |first| {
             let last_start = budget.header
                 + (0..5).map(|b| budget.side[b] + mant[b]).sum::<u32>()
                 + budget.side[5];
             pack::skips(first.saturating_sub(last_start))
         });
+        let ext = &self.ext[..self.ext_len];
 
         let (order, n) = s.order();
         let order = &order[..n.min(MAX_SLOTS)];
         let mut w = BitWriter::new(out);
         self.header(&mut w, off)?;
-        for (b, skip) in skips.into_iter().enumerate().take(s.blocks) {
+        for (b, pad) in pad.into_iter().enumerate().take(s.blocks) {
+            let skip = pad.map_or(skip_of(ext, b), |n| pack::ZEROS.get(..usize::from(n)));
             pack::block_side(&mut w, s, &self.side, choices, off, b, skip)?;
             #[cfg(test)]
             if b == 5 {
@@ -525,12 +590,19 @@ mod tests {
     }
 
     /// The fallback frame, all offsets zero, fits every codec and rate with the side
-    /// information at its largest: noise that jumps 60 dB from block to block in every channel, so every
-    /// block sends exponents and coordinates.
+    /// information at its largest: noise that jumps 60 dB from block to block in every
+    /// channel, so every block sends exponents and coordinates; on E-AC-3, with as large
+    /// an extension as the stream takes.
     #[test]
     fn silence_fits_every_rate() {
         for config in configs() {
             let mut enc = Ac3::new(config.core());
+            if enc.stream.eac3() {
+                assert!(enc.ext_room > 0, "{config:?}");
+                let full = vec![0x5a; enc.ext_room + 1];
+                assert!(enc.set_extension(&full).is_err(), "{config:?}");
+                enc.set_extension(&full[1..]).unwrap();
+            }
             let mut out = vec![0u8; enc.frame_bytes()];
             let mut seed = 3u32;
             for (c, p) in enc.pcm_mut().iter_mut().enumerate() {

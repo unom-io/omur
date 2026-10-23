@@ -160,8 +160,8 @@ pub(crate) struct Choices<'a> {
     pub(crate) remat: [bool; 4],
 }
 
-/// Block `blk`'s fields ahead of its mantissas (§5.3.3, E.1.2.4), with `skip` bytes of
-/// skip field. Everything frame-wide goes in block 0 and is reused after. E-AC-3 moves the
+/// Block `blk`'s fields ahead of its mantissas (§5.3.3, E.1.2.4), with `skip` as its skip
+/// field, 511 bytes at most. Everything frame-wide goes in block 0 and is reused after. E-AC-3 moves the
 /// exponent strategies to audfrm, implies the flags block 0 must set, and adds the tool
 /// flags, all off.
 pub(crate) fn block_side(
@@ -171,7 +171,7 @@ pub(crate) fn block_side(
     choices: Choices,
     off: &Offsets,
     blk: usize,
-    skip: Option<u16>,
+    skip: Option<&[u8]>,
 ) -> Result<(), Overflow> {
     let first = blk == 0;
     let e = s.eac3();
@@ -322,12 +322,17 @@ pub(crate) fn block_side(
         w.put(0, 1)?; // deltbaie; E-AC-3 leaves dbaflde clear
     }
     w.put(u32::from(skip.is_some()), 1)?; // skiple
-    if let Some(n) = skip {
-        w.put(u32::from(n), 9)?;
-        w.zeros(8 * usize::from(n))?;
+    if let Some(bytes) = skip {
+        w.put(bytes.len() as u32, 9)?;
+        for b in bytes {
+            w.put(u32::from(*b), 8)?;
+        }
     }
     Ok(())
 }
+
+/// The bytes of a skip field that only pads.
+pub(crate) const ZEROS: [u8; 511] = [0; 511];
 
 /// Skip fields in blocks 2 to 4 that move block 5's mantissas `deficit` bits later, to the
 /// 5/8 point (§5.5 constraint 2). Each costs 9 bits plus its bytes, 511 at most.
