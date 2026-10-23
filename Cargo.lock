@@ -68,6 +68,7 @@ version = "0.1.0"
 name = "omur-probe"
 version = "0.1.0"
 dependencies = [
+ "omur",
  "oxideav-ac3",
  "oxideav-core",
  "vuio-codec-ac3",

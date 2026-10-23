@@ -1,17 +1,35 @@
-// AC-3 encoder probe: a reference Rust encoder vs ffmpeg's ac3, both decoded by ffmpeg.
+// AC-3 encoder probe: omur or a reference Rust encoder vs ffmpeg's ac3, decoded by ffmpeg.
 // usage: ac3probe gen <out.s16> | enc <in.s16> <out.ac3> <kbps> | cmp <ref.s16> <dec.f32>
+// `enc` and `cmp` read `CH` channels (6, or 2 for FL FR); `enc` feeds `CHUNK` samples a push.
 use std::f32::consts::PI;
 use std::time::Instant;
 
-#[cfg(not(feature = "vuio"))]
+#[cfg(all(not(feature = "omur"), not(feature = "vuio")))]
 use {oxideav_ac3 as ac3, oxideav_core as codec_core};
-#[cfg(feature = "vuio")]
+#[cfg(all(not(feature = "omur"), feature = "vuio"))]
 use {vuio_codec_ac3 as ac3, vuio_codec_core as codec_core};
 
+#[cfg(not(feature = "omur"))]
 use codec_core::{AudioFrame, CodecId, CodecParameters, Error, Frame, SampleFormat};
 
 const SR: usize = 48_000;
 const CH: usize = 6; // WAV order: FL FR FC LFE SL SR
+
+/// Channels `enc` and `cmp` read: `CH` from the environment, 6 by default.
+fn channels() -> usize {
+    std::env::var("CH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(CH)
+}
+
+/// Samples per push: `CHUNK` from the environment, 5 ms by default.
+fn chunk() -> usize {
+    std::env::var("CHUNK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(SR / 200)
+}
 
 fn generate(path: &str) {
     let n = SR * 10;
@@ -62,6 +80,57 @@ fn generate(path: &str) {
     std::fs::write(path, out).unwrap();
 }
 
+#[cfg(feature = "omur")]
+fn enc(inp: &str, outp: &str, kbps: u64) {
+    let ch = channels();
+    let pcm: Vec<f32> = std::fs::read(inp)
+        .unwrap()
+        .chunks_exact(2)
+        .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+        .collect();
+    let layout = if ch == 2 {
+        omur::Layout::Stereo
+    } else {
+        omur::Layout::Surround51
+    };
+    let config = omur::Config::new(omur::Codec::Ac3, layout, kbps as u32).unwrap();
+    let mut e = omur::Encoder::new(config).unwrap();
+    // the tail: silence until the frame holding the last sample is out
+    let mut input = pcm;
+    input.resize(input.len() + config.delay_samples() * ch, 0.0);
+    let frames = input.len() / ch;
+    let step = chunk();
+    let mut out = Vec::new();
+    let (mut slowest, mut slow_at) = (0f64, 0u64);
+    let t0 = Instant::now();
+    for c in (0..frames).step_by(step) {
+        let n = step.min(frames - c);
+        // a push may complete one frame, so it carries one frame's samples at most
+        for piece in input[c * ch..(c + n) * ch].chunks(config.frame_samples() * ch) {
+            let t = Instant::now();
+            e.push(piece).unwrap();
+            let dt = t.elapsed().as_secs_f64();
+            if let Some(frame) = e.pull() {
+                if dt > slowest {
+                    (slowest, slow_at) = (dt, frame.pts);
+                }
+                out.extend_from_slice(frame.bytes);
+            }
+        }
+    }
+    let dt = t0.elapsed().as_secs_f64();
+    std::fs::write(outp, &out).unwrap();
+    let secs = (frames - config.delay_samples()) as f64 / SR as f64;
+    println!(
+        "encoded {secs:.1} s of {ch} ch in {dt:.3} s = {:.0}x realtime, {} bytes; slowest frame \
+         {:.0} us (pts {slow_at})",
+        secs / dt,
+        out.len(),
+        slowest * 1e6,
+    );
+}
+
+#[cfg(not(feature = "omur"))]
 fn enc(inp: &str, outp: &str, kbps: u64) {
     let raw = std::fs::read(inp).unwrap();
     let wav: Vec<i16> = raw
@@ -86,10 +155,7 @@ fn enc(inp: &str, outp: &str, kbps: u64) {
     let mut out = Vec::new();
     let t0 = Instant::now();
     // feed in 5 ms chunks, like the audio plane would
-    let chunk = std::env::var("CHUNK")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(SR / 200);
+    let chunk = chunk();
     for c in (0..frames).step_by(chunk) {
         let n = chunk.min(frames - c);
         let data = bytes[c * CH * 2..(c + n) * CH * 2].to_vec();
@@ -123,6 +189,7 @@ fn enc(inp: &str, outp: &str, kbps: u64) {
 }
 
 fn cmp(refp: &str, decp: &str) {
+    let ch_n = channels();
     let r: Vec<f32> = std::fs::read(refp)
         .unwrap()
         .chunks_exact(2)
@@ -133,8 +200,8 @@ fn cmp(refp: &str, decp: &str) {
         .chunks_exact(4)
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect();
-    let (nr, nd) = (r.len() / CH, d.len() / CH);
-    let ch = |v: &[f32], c: usize, n: usize| (0..n).map(|i| v[i * CH + c]).collect::<Vec<f32>>();
+    let (nr, nd) = (r.len() / ch_n, d.len() / ch_n);
+    let ch = |v: &[f32], c: usize, n: usize| (0..n).map(|i| v[i * ch_n + c]).collect::<Vec<f32>>();
     let names = ["FL", "FR", "FC", "LFE", "SL", "SR"];
     // one lag for the whole stream: search on FL
     let rf = ch(&r, 0, nr);
@@ -154,10 +221,10 @@ fn cmp(refp: &str, decp: &str) {
     println!("lag {lag} samples ({:.1} ms)", lag as f64 / 48.0);
     // channel mapping: which decoded channel correlates best with each ref channel
     let n = (nr.min(nd - lag)) - SR; // skip the last second's tail
-    for c in 0..CH {
+    for c in 0..ch_n {
         let rc = ch(&r, c, nr);
         let mut bestd = (0usize, f64::MIN);
-        for dc in 0..CH {
+        for dc in 0..ch_n {
             let dd = ch(&d, dc, nd);
             let x: f64 = (SR / 2..n).map(|i| (rc[i] * dd[i + lag]) as f64).sum();
             if x > bestd.1 {

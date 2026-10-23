@@ -15,14 +15,17 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
-# One reference encoder per build: `--no-default-features --features vuio` swaps in the fork.
-# The fork declares rustc 1.98; it builds on 1.96 with `--ignore-rust-version`.
+# One encoder per build: `--no-default-features --features omur` encodes with omur, `--features
+# vuio` with the fork. The fork declares rustc 1.98; it builds on 1.96 with
+# `--ignore-rust-version`.
 [features]
 default = ["oxideav"]
 oxideav = ["dep:oxideav-ac3", "dep:oxideav-core"]
 vuio = ["dep:vuio-codec-ac3", "dep:vuio-codec-core"]
+omur = ["dep:omur"]
 
 [dependencies]
+omur = { workspace = true, optional = true }
 oxideav-ac3 = { workspace = true, optional = true }
 oxideav-core = { workspace = true, optional = true }
 vuio-codec-ac3 = { version = "=0.0.1", optional = true }
