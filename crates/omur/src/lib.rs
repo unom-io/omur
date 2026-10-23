@@ -267,25 +267,24 @@ impl Encoder {
         if n >= need && (self.ready || n - need >= self.config.frame_samples()) {
             return Err(Error::Backlog);
         }
-        let mut samples = pcm.chunks_exact(channels);
-        let mut left = n;
-        while left > 0 {
-            let take = left.min(ac3::SPAN - self.fill);
-            let span = self.core.pcm_mut();
-            for (j, sample) in samples.by_ref().take(take).enumerate() {
-                for (dst, slot) in span.iter_mut().zip(self.wav_slot) {
+        let mut rest = pcm;
+        while !rest.is_empty() {
+            let take = (rest.len() / channels).min(ac3::SPAN - self.fill);
+            let (chunk, after) = rest.split_at(take * channels);
+            rest = after;
+            let fill = self.fill;
+            for (dst, slot) in self.core.pcm_mut().iter_mut().zip(self.wav_slot) {
+                let dst = dst.iter_mut().skip(fill).take(take);
+                for (d, sample) in dst.zip(chunk.chunks_exact(channels)) {
                     let v = sample.get(*slot).copied().unwrap_or(0.0);
-                    if let Some(d) = dst.get_mut(self.fill + j) {
-                        *d = if v.is_finite() {
-                            v.clamp(-1.0, 1.0)
-                        } else {
-                            0.0
-                        };
-                    }
+                    *d = if v.is_finite() {
+                        v.clamp(-1.0, 1.0)
+                    } else {
+                        0.0
+                    };
                 }
             }
             self.fill += take;
-            left -= take;
             if self.fill == ac3::SPAN {
                 self.core.encode(&mut self.out);
                 self.ready = true;

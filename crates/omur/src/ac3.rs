@@ -161,6 +161,8 @@ pub(crate) struct Ac3 {
     coupling: Option<Box<coupling::Frame>>,
     /// The frame's rematrixing flags, 2/0 only.
     remat: [bool; 4],
+    /// Where the last frame's shared offset search ended, where the next one starts.
+    hint: u32,
     transients: transient::Detector,
     /// Bits through block 1 of the last frame, which crc1 must cover.
     #[cfg(test)]
@@ -220,6 +222,7 @@ impl Ac3 {
             mant: Box::new(Mantissas::new()),
             coupling: cpl.map(|b| Box::new(coupling::Frame::new(b))),
             remat: [false; 4],
+            hint: 0,
             transients: transient::Detector::default(),
             #[cfg(test)]
             first_bits: 0,
@@ -252,7 +255,7 @@ impl Ac3 {
         let Ok(budget) = self.size(out) else {
             return;
         };
-        let tuned = tuner::tune(&self.alloc, &budget);
+        let tuned = tuner::tune(&self.alloc, &budget, &mut self.hint);
         let written = tuned.map(|off| self.write(out, &budget, &off));
         if !matches!(written, Some(Ok(()))) {
             let _ = self.write(out, &budget, &Offsets::default());
@@ -454,7 +457,7 @@ mod tests {
                 enc.analyse();
                 let what = format!("{layout:?} {kbps}");
                 let budget = enc.size(&mut out).expect(&what);
-                assert!(tuner::tune(&enc.alloc, &budget).is_some(), "{what}");
+                assert!(tuner::tune(&enc.alloc, &budget, &mut 0).is_some(), "{what}");
                 enc.write(&mut out, &budget, &Offsets::default())
                     .expect(&what);
                 enc.assert_constraints(&what);

@@ -103,10 +103,11 @@ fn tally(alloc: &[Alloc], off: &Offsets) -> Tally {
 const GIVE: u8 = 4;
 
 /// The offsets the frame is coded with: the largest `16·csnroffst + fsnroffst` shared by
-/// every slot, by binary search; then, from `GIVE` steps under it, one more fine step at a
-/// time for the slot whose step costs fewest bits, while the frame holds it. `None` if not
-/// even silence fits.
-pub(crate) fn tune(alloc: &[Alloc], budget: &Budget) -> Option<Offsets> {
+/// every slot, searched outwards from `hint` (the last frame's, set to this one's) and then
+/// halved; then, from
+/// `GIVE` steps under it, one more fine step at a time for the slot whose step costs fewest
+/// bits, while the frame holds it. `None` if not even silence fits.
+pub(crate) fn tune(alloc: &[Alloc], budget: &Budget, hint: &mut u32) -> Option<Offsets> {
     let slots = alloc.len().min(MAX_SLOTS);
     let at = |v: u32| Offsets {
         csnr: (v >> 4) as u8,
@@ -115,15 +116,41 @@ pub(crate) fn tune(alloc: &[Alloc], budget: &Budget) -> Option<Offsets> {
     if !fits(&[0; 6], budget) {
         return None;
     }
+    let holds = |v: u32| v == 0 || fits(&tally(alloc, &at(v)), budget);
+    // lo holds, hi does not (1024 is past the last offset)
     let (mut lo, mut hi) = (0u32, 1024u32);
+    let start = (*hint).min(1023);
+    let mut step = 1;
+    if holds(start) {
+        lo = start;
+        while lo + step < hi {
+            if !holds(lo + step) {
+                hi = lo + step;
+                break;
+            }
+            lo += step;
+            step *= 2;
+        }
+    } else {
+        hi = start;
+        while hi > step {
+            if holds(hi - step) {
+                lo = hi - step;
+                break;
+            }
+            hi -= step;
+            step *= 2;
+        }
+    }
     while hi - lo > 1 {
         let mid = (lo + hi) / 2;
-        if fits(&tally(alloc, &at(mid)), budget) {
+        if holds(mid) {
             lo = mid;
         } else {
             hi = mid;
         }
     }
+    *hint = lo;
     let mut off = at(lo);
     if lo == 0 {
         return Some(off);
@@ -220,9 +247,9 @@ mod tests {
             channel_at(0, 7, 2, [0, 0, 2, 2, 2, 2]),
             channel_at(133, 217, 4, [0, 1, 2, 3, 4, 5]),
         ];
-        for budget in frames() {
+        for (budget, mut hint) in frames().zip([0, 1023, 300, 77, 512, 160, 9]) {
             let frame = budget.frame;
-            let off = tune(&alloc, &budget).expect("silence fits");
+            let off = tune(&alloc, &budget, &mut hint).expect("silence fits");
             assert!(
                 off.csnr <= 63 && off.fsnr.iter().all(|f| *f <= 15),
                 "{off:?}"

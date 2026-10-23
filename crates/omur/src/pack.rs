@@ -283,10 +283,9 @@ pub(crate) fn mantissas(
         let (Some(code), Some(bits), Some(s)) = (m.code.get(c), m.bits.get(c), side.get(c)) else {
             break;
         };
+        // a bin without bits puts nothing: no branch to mispredict on bap 0
         for (v, n) in code.iter().zip(bits).take(s.end).skip(s.start) {
-            if *n > 0 {
-                w.put(u32::from(*v), u32::from(*n))?;
-            }
+            w.put(u32::from(*v), u32::from(*n))?;
         }
     }
     Ok(())
@@ -302,19 +301,20 @@ pub(crate) fn close(mut w: BitWriter, s: &Stream) -> Result<(), Overflow> {
     Ok(())
 }
 
-/// Sets crc1 and crc2 in a frame `close` has written. crc2 never equals the syncword:
+/// Sets crc1 and crc2 in a frame `close` has written. crc1 leaves the register at zero
+/// over the first 5/8, so crc2 runs over the rest alone. crc2 never equals the syncword:
 /// crcrsv flips when it would.
 pub(crate) fn seal(frame: &mut [u8], s: &Stream) {
     let n = s.frame_bytes.min(frame.len());
-    if n < 6 || s.crc1_end > n {
+    if n < 6 || s.crc1_end + 2 > n {
         return;
     }
     let crc1 = crc16_leading(&frame[4..s.crc1_end], s.crc1_back);
     frame[2..4].copy_from_slice(&crc1.to_be_bytes());
-    let mut crc2 = crc16(&frame[2..n - 2]);
+    let mut crc2 = crc16(&frame[s.crc1_end..n - 2]);
     if crc2 == 0x0b77 {
         frame[n - 3] ^= 0x01; // crcrsv, the bit before crc2
-        crc2 = crc16(&frame[2..n - 2]);
+        crc2 = crc16(&frame[s.crc1_end..n - 2]);
     }
     frame[n - 2..n].copy_from_slice(&crc2.to_be_bytes());
 }

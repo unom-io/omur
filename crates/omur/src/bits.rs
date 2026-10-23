@@ -6,14 +6,14 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Overflow;
 
-/// MSB-first writer over a byte slice. Whole bytes are stored as they complete; `finish`
-/// stores the partial last one, zero-padded.
+/// MSB-first writer over a byte slice. Bits gather in a 64-bit accumulator and are stored
+/// 32 at a time; `finish` stores the rest, zero-padded.
 pub(crate) struct BitWriter<'a> {
     buf: &'a mut [u8],
     /// Bytes stored so far.
     byte: usize,
     acc: u64,
-    /// Bits held in `acc`, below 8 between calls.
+    /// Bits held in `acc`, below 32 between calls.
     held: u32,
 }
 
@@ -33,6 +33,7 @@ impl<'a> BitWriter<'a> {
     }
 
     /// Writes the low `bits` bits of `value`, `bits` at most 32.
+    #[inline]
     pub(crate) fn put(&mut self, value: u32, bits: u32) -> Result<(), Overflow> {
         if self.position() + bits as usize > self.buf.len() * 8 {
             return Err(Overflow);
@@ -40,12 +41,13 @@ impl<'a> BitWriter<'a> {
         let mask = (1u64 << bits) - 1;
         self.acc = (self.acc << bits) | (u64::from(value) & mask);
         self.held += bits;
-        while self.held >= 8 {
-            self.held -= 8;
-            if let Some(b) = self.buf.get_mut(self.byte) {
-                *b = (self.acc >> self.held) as u8;
+        if self.held >= 32 {
+            self.held -= 32;
+            let word = (self.acc >> self.held) as u32;
+            if let Some(dst) = self.buf.get_mut(self.byte..self.byte + 4) {
+                dst.copy_from_slice(&word.to_be_bytes());
             }
-            self.byte += 1;
+            self.byte += 4;
         }
         Ok(())
     }
@@ -60,15 +62,16 @@ impl<'a> BitWriter<'a> {
         Ok(())
     }
 
-    /// Stores the partial last byte, zero-padded, and returns the bytes written.
+    /// Stores the bits still held, the last byte zero-padded, and returns the bytes written.
     pub(crate) fn finish(mut self) -> usize {
-        if self.held > 0 {
-            let pad = 8 - self.held;
+        while self.held > 0 {
+            let take = self.held.min(8);
+            self.held -= take;
+            let byte = ((self.acc >> self.held) << (8 - take)) as u8;
             if let Some(b) = self.buf.get_mut(self.byte) {
-                *b = (self.acc << pad) as u8;
+                *b = byte;
             }
             self.byte += 1;
-            self.held = 0;
         }
         self.byte
     }
