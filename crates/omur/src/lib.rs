@@ -263,13 +263,14 @@ impl Encoder {
             return Err(Error::Length);
         }
         let n = pcm.len() / channels;
-        let need = ac3::SPAN - self.fill;
+        let span = self.core.span();
+        let need = span - self.fill;
         if n >= need && (self.ready || n - need >= self.config.frame_samples()) {
             return Err(Error::Backlog);
         }
         let mut rest = pcm;
         while !rest.is_empty() {
-            let take = (rest.len() / channels).min(ac3::SPAN - self.fill);
+            let take = (rest.len() / channels).min(span - self.fill);
             let (chunk, after) = rest.split_at(take * channels);
             rest = after;
             let fill = self.fill;
@@ -285,7 +286,7 @@ impl Encoder {
                 }
             }
             self.fill += take;
-            if self.fill == ac3::SPAN {
+            if self.fill == span {
                 self.core.encode(&mut self.out);
                 self.ready = true;
                 self.out_pts = self.pts;

@@ -1,5 +1,6 @@
-//! The AC-3 frame: six blocks, the per-frame decisions that feed exponents, allocation and
-//! packing, and channel coupling (§8.2.4) in `coupling`.
+//! The coded frame: its blocks (six on AC-3; one, two, three or six on E-AC-3), the
+//! per-frame decisions that feed exponents, allocation and packing, and channel coupling
+//! (§8.2.4) in `coupling`. Every decision restarts at the frame's block 0.
 
 pub(crate) mod coupling;
 mod transient;
@@ -18,15 +19,16 @@ use coupling::Bands;
 /// choice for the listening pass, which decides the default.
 const BLOCK_SWITCHING: bool = true;
 
-/// Samples a frame's six windows span: the frame and the 256 past it.
+/// Samples the longest frame's windows span: six blocks and the 256 past them. A frame of
+/// `n` blocks uses the first `256·n + 256`.
 pub(crate) const SPAN: usize = 6 * BLOCK_SAMPLES + BLOCK_SAMPLES;
 
 /// `endmant` of the LFE (§7.1.3).
 const LFE_END: usize = 7;
 
-/// The six blocks' transforms of one channel: one 512-point or a short pair each.
-fn transform(pcm: &[f32; SPAN], blksw: &[bool; 6], coef: &mut [[f32; 256]; 6]) {
-    for (b, out) in coef.iter_mut().enumerate() {
+/// The first `blocks` blocks' transforms of one channel: one 512-point or a short pair each.
+fn transform(pcm: &[f32; SPAN], blksw: &[bool; 6], coef: &mut [[f32; 256]; 6], blocks: usize) {
+    for (b, out) in coef.iter_mut().enumerate().take(blocks) {
         let Some(x) = pcm[BLOCK_SAMPLES * b..].first_chunk::<512>() else {
             continue;
         };
@@ -39,9 +41,9 @@ fn transform(pcm: &[f32; SPAN], blksw: &[bool; 6], coef: &mut [[f32; 256]; 6]) {
 }
 
 /// One slot's frame up to the SNR offsets: raw exponents, the exponent sets and their
-/// masking curves over `alloc.start..alloc.end`. A set covers the blocks up to the next
-/// that sends one, with each bin's smallest exponent over them; `fixed` is the bits a set
-/// sends besides its groups.
+/// masking curves over `alloc.start..alloc.end`, for the frame's `alloc.blocks` blocks. A
+/// set covers the blocks up to the next that sends one, with each bin's smallest exponent
+/// over them; `fixed` is the bits a set sends besides its groups.
 fn envelope(
     coef: &[[f32; 256]; 6],
     raw: &mut [[u8; 256]; 6],
@@ -50,14 +52,14 @@ fn envelope(
     fixed: u32,
     lfe: bool,
 ) {
-    let (start, end) = (alloc.start, alloc.end);
-    for (c, r) in coef.iter().zip(raw.iter_mut()) {
+    let (start, end, n) = (alloc.start, alloc.end, alloc.blocks);
+    for (c, r) in coef.iter().zip(raw.iter_mut()).take(n) {
         extract(c, end, r);
     }
-    side.strategy = plan(raw, start, end, fixed, lfe);
+    side.strategy = plan(raw, start, end, fixed, lfe, n);
     let mut b = 0;
-    while b < 6 {
-        let len = 1 + side.strategy[b + 1..]
+    while b < n {
+        let len = 1 + side.strategy[b + 1..n]
             .iter()
             .take_while(|st| **st == REUSE)
             .count();
@@ -91,14 +93,9 @@ fn envelope(
 /// Rematrixes a 2/0 frame (§8.2.6): in each of the first `bands` rematrixing bands below
 /// `top`, the frame's L and R become (L + R)/2 and (L − R)/2 where that pair codes for
 /// less: noise at N in L and R needs N/2 in both of the pair, so the pair wins when four
-/// times the product of its energies is under the product of L's and R's. Returns the
-/// flags.
-fn rematrix(
-    l: &mut [[f32; 256]; 6],
-    r: &mut [[f32; 256]; 6],
-    bands: usize,
-    top: usize,
-) -> [bool; 4] {
+/// times the product of its energies is under the product of L's and R's. `l` and `r` hold
+/// the frame's blocks. Returns the flags.
+fn rematrix(l: &mut [[f32; 256]], r: &mut [[f32; 256]], bands: usize, top: usize) -> [bool; 4] {
     const EDGES: [usize; 5] = [13, 25, 37, 61, 253];
     let mut flags = [false; 4];
     for (k, flag) in flags.iter_mut().enumerate().take(bands) {
@@ -177,6 +174,7 @@ pub(crate) struct Ac3 {
 
 impl Ac3 {
     pub(crate) fn new(layout: Layout, kbps: u32) -> Ac3 {
+        let blocks = 6;
         let (acmod, nfchans, lfe) = match layout {
             Layout::Stereo => (2, 2, false),
             _ => (7, 5, true),
@@ -188,6 +186,7 @@ impl Ac3 {
         let crc1_end = 2 * ((words >> 1) + (words >> 3));
         let (cpl, chbwcod) = coupling_plan(layout, kbps);
         let stream = Stream {
+            blocks,
             acmod,
             lfe,
             nfchans,
@@ -220,7 +219,7 @@ impl Ac3 {
                 })
                 .collect(),
             alloc: (0..slots)
-                .map(|c| Alloc::new(range(c).0, range(c).1))
+                .map(|c| Alloc::new(range(c).0, range(c).1, blocks))
                 .collect(),
             mant: Box::new(Mantissas::new()),
             coupling: cpl.map(|b| Box::new(coupling::Frame::new(b))),
@@ -240,15 +239,22 @@ impl Ac3 {
         self.stream.frame_bytes
     }
 
-    /// The input of every channel, in slot order.
+    /// Samples per channel the frame's windows span: its blocks and the 256 past them.
+    pub(crate) fn span(&self) -> usize {
+        self.stream.blocks * BLOCK_SAMPLES + BLOCK_SAMPLES
+    }
+
+    /// The input of every channel, in slot order, `span` samples from the frame's first
+    /// window.
     pub(crate) fn pcm_mut(&mut self) -> &mut [[f32; SPAN]] {
         &mut self.pcm
     }
 
     /// Keeps the 256 samples the next frame's first window shares with this one.
     pub(crate) fn advance(&mut self) {
+        let last = self.stream.blocks * BLOCK_SAMPLES;
         for p in self.pcm.iter_mut() {
-            p.copy_within(6 * BLOCK_SAMPLES.., 0);
+            p.copy_within(last..last + BLOCK_SAMPLES, 0);
         }
     }
 
@@ -275,29 +281,29 @@ impl Ac3 {
     /// masking curves.
     fn analyse(&mut self) {
         let s = &self.stream;
-        let nf = s.nfchans;
+        let (nf, n) = (s.nfchans, s.blocks);
         if BLOCK_SWITCHING {
             let mut blksw = [[false; 6]; coupling::MAX_FBW];
-            self.transients.detect(&self.pcm[..nf], &mut blksw);
+            self.transients.detect(&self.pcm[..nf], &mut blksw, n);
             for (side, sw) in self.side.iter_mut().zip(blksw).take(nf) {
                 side.blksw = sw;
             }
         }
         for (c, p) in self.pcm.iter().enumerate() {
             if let (Some(coef), Some(side)) = (self.coef.get_mut(c), self.side.get(c)) {
-                transform(p, &side.blksw, coef);
+                transform(p, &side.blksw, coef, n);
             }
         }
         if s.acmod == 2
             && let [l, r, ..] = &mut self.coef[..]
         {
             let top = s.cpl.map_or(self.alloc[0].end, |b| b.start());
-            self.remat = rematrix(l, r, s.remat_bands(), top);
+            self.remat = rematrix(&mut l[..n], &mut r[..n], s.remat_bands(), top);
         }
         if let (Some(f), Some(cs)) = (self.coupling.as_deref_mut(), s.cpl_slot()) {
             let (fbw, rest) = self.coef.split_at_mut(nf);
             if let Some(cpl) = rest.get_mut(cs - nf) {
-                coupling::form(fbw, cpl, f);
+                coupling::form(fbw, cpl, f, n);
             }
         }
         for c in 0..s.slots() {
@@ -336,7 +342,7 @@ impl Ac3 {
         let mut w = BitWriter::new(out);
         pack::header(&mut w, s)?;
         budget.header = w.position() as u32;
-        for b in 0..6 {
+        for b in 0..s.blocks {
             let at = w.position();
             let off = Offsets::default();
             pack::block_side(&mut w, s, &self.side, choices, &off, b, None)?;
@@ -362,7 +368,7 @@ impl Ac3 {
         let order = &order[..n.min(MAX_SLOTS)];
         let mut w = BitWriter::new(out);
         pack::header(&mut w, s)?;
-        for (b, skip) in skips.into_iter().enumerate() {
+        for (b, skip) in skips.into_iter().enumerate().take(s.blocks) {
             pack::block_side(&mut w, s, &self.side, choices, off, b, skip)?;
             #[cfg(test)]
             if b == 5 {

@@ -141,12 +141,18 @@ fn code(idx: &[u16], out: &mut Coords) {
 /// down, since no exponent codes a coefficient of 1 or more.
 const PEAK: f32 = 0.98;
 
-/// Forms the frame's coupling channel into `cpl`, the sum of `coef[..nf]` over the coupling
-/// range, and decides `frame`'s coordinates from each band's energy ratio. The sum, not
-/// the average, keeps the channel clear of the hearing threshold at the top of the band.
-/// A channel's coordinates hold from block to block while every band stays within
-/// `MOVE_STEPS` of the run's ratio, energies summed over the run.
-pub(crate) fn form(coef: &[[[f32; 256]; 6]], cpl: &mut [[f32; 256]; 6], frame: &mut Frame) {
+/// Forms the coupling channel of the frame's first `blocks` blocks into `cpl`, the sum of
+/// `coef[..nf]` over the coupling range, and decides `frame`'s coordinates from each band's
+/// energy ratio. The sum, not the average, keeps the channel clear of the hearing threshold
+/// at the top of the band. A channel's coordinates hold from block to block while every
+/// band stays within `MOVE_STEPS` of the run's ratio, energies summed over the run.
+pub(crate) fn form(
+    coef: &[[[f32; 256]; 6]],
+    cpl: &mut [[f32; 256]; 6],
+    frame: &mut Frame,
+    blocks: usize,
+) {
+    let blocks = blocks.clamp(1, 6);
     let bands = frame.bands;
     let (start, end) = (bands.start(), bands.end().min(256));
     let n = bands.count().min(MAX_BANDS);
@@ -154,7 +160,7 @@ pub(crate) fn form(coef: &[[[f32; 256]; 6]], cpl: &mut [[f32; 256]; 6], frame: &
     let nf = coef.len().min(MAX_FBW);
     let mut energy = [[0f32; MAX_BANDS]; 6];
     let mut own = [[[0f32; MAX_BANDS]; 6]; MAX_FBW];
-    for b in 0..6 {
+    for b in 0..blocks {
         let out = &mut cpl[b];
         out.fill(0.0);
         for c in coef.iter().take(nf) {
@@ -191,15 +197,17 @@ pub(crate) fn form(coef: &[[[f32; 256]; 6]], cpl: &mut [[f32; 256]; 6], frame: &
     for (c, own) in own.iter().enumerate().take(nf) {
         let mut first = 0;
         let (mut acc_own, mut acc_cpl) = (own[0], energy[0]);
-        for b in 1..=6 {
+        for b in 1..=blocks {
             let run = ratio(&acc_own, &acc_cpl);
-            let moved = b == 6 || {
+            let moved = b == blocks || {
                 let here = ratio(&own[b], &energy[b]);
                 here.iter()
                     .zip(&run)
                     .any(|(h, r)| h.abs_diff(*r) > MOVE_STEPS)
             };
-            frame.send[b.min(5)][c] = false;
+            if b < blocks {
+                frame.send[b][c] = false;
+            }
             if !moved {
                 for k in 0..n {
                     acc_own[k] += own[b][k];
@@ -215,7 +223,7 @@ pub(crate) fn form(coef: &[[[f32; 256]; 6]], cpl: &mut [[f32; 256]; 6], frame: &
             }
             frame.send[first][c] = true;
             code(&idx[..n], &mut frame.coords[first][c]);
-            if b < 6 {
+            if b < blocks {
                 (first, acc_own, acc_cpl) = (b, own[b], energy[b]);
             }
         }
@@ -305,7 +313,7 @@ mod tests {
             strc: 0b10,
         };
         let mut frame = Frame::new(bands);
-        form(&coef, &mut cpl, &mut frame);
+        form(&coef, &mut cpl, &mut frame, 6);
         assert!(frame.send[0].iter().all(|s| *s));
         let c = &frame.coords[0][2];
         for k in 0..bands.count() {

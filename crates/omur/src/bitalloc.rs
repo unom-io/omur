@@ -37,8 +37,9 @@ pub(crate) struct Offsets {
     pub(crate) fsnr: [u8; MAX_SLOTS],
 }
 
-/// One channel's allocation over a frame, bins `start..end`. Each exponent set lives at the
-/// block that sends it; `set[b]` names the block whose set block `b` uses.
+/// One channel's allocation over a frame of `blocks` blocks, bins `start..end`. Each
+/// exponent set lives at the block that sends it; `set[b]` names the block whose set block
+/// `b` uses.
 pub(crate) struct Alloc {
     /// Exponents as the decoder rebuilds them.
     pub(crate) exp: [[u8; 256]; 6],
@@ -49,10 +50,11 @@ pub(crate) struct Alloc {
     pub(crate) set: [usize; 6],
     pub(crate) start: usize,
     pub(crate) end: usize,
+    pub(crate) blocks: usize,
 }
 
 impl Alloc {
-    pub(crate) fn new(start: usize, end: usize) -> Alloc {
+    pub(crate) fn new(start: usize, end: usize, blocks: usize) -> Alloc {
         Alloc {
             exp: [[24; 256]; 6],
             psd: [[0; 256]; 6],
@@ -61,6 +63,7 @@ impl Alloc {
             set: [0; 6],
             start,
             end,
+            blocks,
         }
     }
 }

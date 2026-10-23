@@ -58,24 +58,27 @@ pub(crate) fn group_count(strategy: u8, start: usize, end: usize) -> usize {
     }
 }
 
-/// The strategy of each block. A block starts a fresh set when its raw exponents have moved
-/// from the set's first block by more exponent steps, summed over the bins, than a fresh D15
-/// set costs in bits (`fixed` plus its groups): a bin's mantissa takes about a bit more for
-/// each step its envelope sits under it. Each set is sized by how many blocks it covers
-/// (one: D45, two or three: D25, more: D15, §8.2.8), the 32 splits of six blocks ffmpeg's
-/// streams use; D15 or reuse only where `d15_only` (the LFE). Block 0 always starts a set.
+/// The strategy of each of a frame's `blocks` blocks. A block starts a fresh set when its
+/// raw exponents have moved from the set's first block by more exponent steps, summed over
+/// the bins, than a fresh D15 set costs in bits (`fixed` plus its groups): a bin's mantissa
+/// takes about a bit more for each step its envelope sits under it. Each set is sized by how
+/// many blocks it covers (one: D45, two or three: D25, more: D15, §8.2.8), the 32 splits of
+/// six blocks ffmpeg's streams use; D15 or reuse only where `d15_only` (the LFE). Block 0
+/// always starts a set; blocks past the frame read as reuse.
 pub(crate) fn plan(
     raw: &[[u8; 256]; 6],
     start: usize,
     end: usize,
     fixed: u32,
     d15_only: bool,
+    blocks: usize,
 ) -> [u8; 6] {
+    let n = blocks.min(6);
     let price = fixed + 7 * group_count(D15, start, end) as u32;
     let mut fresh = [false; 6];
     fresh[0] = true;
     let mut first = 0;
-    for b in 1..6 {
+    for b in 1..n {
         let moved: u32 = raw[first][start..end]
             .iter()
             .zip(&raw[b][start..end])
@@ -88,8 +91,8 @@ pub(crate) fn plan(
     }
     let mut out = [REUSE; 6];
     let mut b = 0;
-    while b < 6 {
-        let len = 1 + fresh[b + 1..].iter().take_while(|s| !**s).count();
+    while b < n {
+        let len = 1 + fresh[b + 1..n].iter().take_while(|s| !**s).count();
         out[b] = match len {
             _ if d15_only => D15,
             1 => D45,
@@ -231,32 +234,41 @@ mod tests {
     fn plan_weighs_exponent_bits_against_mantissa_bits() {
         let mut raw = [[10u8; 256]; 6];
         assert_eq!(
-            plan(&raw, 0, 100, 6, false),
+            plan(&raw, 0, 100, 6, false, 6),
             [D15, REUSE, REUSE, REUSE, REUSE, REUSE]
         );
         // 100 bins two steps quieter: 200 bits, less than a set's 237
         raw[3..].fill([12; 256]);
-        assert_eq!(plan(&raw, 0, 100, 6, false)[1..], [REUSE; 5]);
+        assert_eq!(plan(&raw, 0, 100, 6, false, 6)[1..], [REUSE; 5]);
         raw[3..].fill([20; 256]);
         assert_eq!(
-            plan(&raw, 0, 100, 6, false),
+            plan(&raw, 0, 100, 6, false, 6),
             [D25, REUSE, REUSE, D25, REUSE, REUSE]
         );
         raw[4] = [0; 256];
         assert_eq!(
-            plan(&raw, 0, 100, 6, false),
+            plan(&raw, 0, 100, 6, false, 6),
             [D25, REUSE, REUSE, D45, D45, D45]
         );
+        // a shorter frame plans its own blocks and leaves the rest at reuse
         assert_eq!(
-            plan(&raw, 0, 7, 4, true),
+            plan(&raw, 0, 100, 6, false, 3),
+            [D25, REUSE, REUSE, REUSE, REUSE, REUSE]
+        );
+        assert_eq!(
+            plan(&raw, 0, 100, 6, false, 1),
+            [D45, REUSE, REUSE, REUSE, REUSE, REUSE]
+        );
+        assert_eq!(
+            plan(&raw, 0, 7, 4, true, 6),
             [D15, REUSE, REUSE, D15, D15, D15]
         );
         // a coupling channel from bin 133: 36 bins a step apart cost less than its 88 bits
         let mut cpl = [[24u8; 256]; 6];
         cpl.iter_mut().for_each(|b| b[133..169].fill(8));
         cpl[1][133..169].fill(9);
-        assert_eq!(plan(&cpl, 133, 169, 4, false)[1..], [REUSE; 5]);
+        assert_eq!(plan(&cpl, 133, 169, 4, false, 6)[1..], [REUSE; 5]);
         cpl[1][133..169].fill(11);
-        assert_eq!(plan(&cpl, 133, 169, 4, false)[..2], [D45, D45]);
+        assert_eq!(plan(&cpl, 133, 169, 4, false, 6)[..2], [D45, D45]);
     }
 }

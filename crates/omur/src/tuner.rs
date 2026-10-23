@@ -42,7 +42,7 @@ const BY_ADDRESS: [u64; 64] = {
 /// Channel `a`'s tally at `offset`: each set's cost in every block that uses it.
 fn channel(a: &Alloc, offset: i32) -> Tally {
     let mut t = [0u64; 6];
-    for s in 0..6 {
+    for s in 0..a.blocks {
         if a.set[s] != s {
             continue;
         }
@@ -50,7 +50,7 @@ fn channel(a: &Alloc, offset: i32) -> Tally {
         for_each_address(&a.psd[s], &a.mask[s], a.start, a.end, offset, |_, ad| {
             sum += BY_ADDRESS[ad & 63];
         });
-        for (blk, t) in t.iter_mut().enumerate().skip(s) {
+        for (blk, t) in t.iter_mut().enumerate().take(a.blocks).skip(s) {
             if a.set[blk] == s {
                 *t = sum;
             }
@@ -205,7 +205,7 @@ pub(crate) fn fill(alloc: &mut [Alloc], off: &Offsets) {
     let zero = silent(off, alloc.len());
     for (a, fine) in alloc.iter_mut().zip(off.fsnr) {
         let offset = snr_offset(off.csnr, fine);
-        for s in 0..6 {
+        for s in 0..a.blocks {
             if a.set[s] != s {
                 continue;
             }
@@ -223,7 +223,7 @@ mod tests {
     use crate::bitalloc::curve;
 
     fn channel_at(start: usize, end: usize, level: u8, sets: [usize; 6]) -> Alloc {
-        let mut a = Alloc::new(start, end);
+        let mut a = Alloc::new(start, end, 6);
         a.set = sets;
         for s in 0..6 {
             for (i, e) in a.exp[s].iter_mut().enumerate() {
@@ -283,6 +283,18 @@ mod tests {
                 next.fsnr = [0; MAX_SLOTS];
                 assert!(!fits(&tally(&alloc, &next), &budget), "frame {frame}");
             }
+        }
+    }
+
+    /// A frame of fewer blocks tallies its own and nothing past them.
+    #[test]
+    fn a_short_frame_tallies_its_blocks_only() {
+        for blocks in [1, 2, 3] {
+            let mut a = channel_at(0, 253, 3, [0, 1, 1, 0, 0, 0]);
+            a.blocks = blocks;
+            let t = channel(&a, snr_offset(15, 0));
+            assert!(t[..blocks].iter().all(|v| *v > 0), "{blocks}: {t:?}");
+            assert!(t[blocks..].iter().all(|v| *v == 0), "{blocks}: {t:?}");
         }
     }
 

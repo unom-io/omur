@@ -12,6 +12,8 @@ use crate::mantissas::Mantissas;
 /// What the syntax needs of the stream, fixed at construction. Slots hold the
 /// full-bandwidth channels, then the LFE, then the coupling channel.
 pub(crate) struct Stream {
+    /// Blocks per frame: 6 on AC-3; 1, 2, 3 or 6 on E-AC-3.
+    pub(crate) blocks: usize,
     pub(crate) acmod: u8,
     pub(crate) lfe: bool,
     pub(crate) nfchans: usize,

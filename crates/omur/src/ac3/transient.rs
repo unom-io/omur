@@ -28,14 +28,14 @@ pub(crate) struct Detector {
 static SILENT: [f32; SPAN] = [0.0; SPAN];
 
 impl Detector {
-    /// `blksw` of the frame's six blocks for each of `pcm`'s channels: whether the second
-    /// half of the block's window, the 256 samples the frame brings in after it, holds a
-    /// transient. The channels run side by side, so their filters do not wait on each other.
-    pub(crate) fn detect(&mut self, pcm: &[[f32; SPAN]], blksw: &mut [[bool; 6]]) {
+    /// `blksw` of the frame's first `blocks` blocks for each of `pcm`'s channels: whether the
+    /// second half of the block's window, the 256 samples the frame brings in after it, holds
+    /// a transient. The channels run side by side, so their filters do not wait on each other.
+    pub(crate) fn detect(&mut self, pcm: &[[f32; SPAN]], blksw: &mut [[bool; 6]], blocks: usize) {
         let rows: [&[f32; SPAN]; MAX_FBW] = core::array::from_fn(|c| pcm.get(c).unwrap_or(&SILENT));
         let [mut s1, mut s2] = [self.state[0], self.state[1]];
         let k: [&[f32]; 2] = [&HIGHPASS[..5], &HIGHPASS[5..]];
-        for b in 0..6 {
+        for b in 0..blocks.min(6) {
             let mut peak = [[0f32; MAX_FBW]; 4];
             for (q, pk) in peak.iter_mut().enumerate() {
                 let at = BLOCK_SAMPLES * (b + 1) + 64 * q;
@@ -86,7 +86,7 @@ mod tests {
             pcm[0].copy_within(1536.., 0);
             pcm[0][256..256 + frame.len()].copy_from_slice(frame);
             let mut sw = [[false; 6]];
-            d.detect(&pcm, &mut sw);
+            d.detect(&pcm, &mut sw, 6);
             out.extend(sw[0]);
         }
         out
