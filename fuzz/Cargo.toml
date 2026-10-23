@@ -1,0 +1,39 @@
+[package]
+name = "omur-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Stands alone: the root workspace excludes it, and nightly builds it.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = "1"
+omur = { path = "../crates/omur" }
+oxideav-ac3 = "=0.0.11"
+oxideav-core = "=0.1.41"
+
+[[bin]]
+name = "encode"
+path = "fuzz_targets/encode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "chunking"
+path = "fuzz_targets/chunking.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "api"
+path = "fuzz_targets/api.rs"
+test = false
+doc = false
+bench = false
