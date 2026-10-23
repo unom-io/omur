@@ -244,3 +244,71 @@ fn short_blocks_decode_cleanly() {
     let stream: Vec<u8> = frames.iter().flat_map(|(_, f)| f.iter().copied()).collect();
     ffmpeg_decodes(&stream, "short.ac3");
 }
+
+/// ffmpeg's decode of an AC-3 `stream` to `nch` interleaved f32 channels, or `None` where
+/// ffmpeg is not on `PATH`.
+fn ffmpeg_decode(stream: &[u8], nch: usize, name: &str) -> Option<Vec<Vec<f32>>> {
+    let path = std::env::temp_dir().join(format!("omur-{}-{name}", std::process::id()));
+    std::fs::write(&path, stream).unwrap();
+    let out = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-f", "ac3", "-i"])
+        .arg(&path)
+        .args(["-f", "f32le", "-ac", &nch.to_string(), "-"])
+        .output();
+    let _ = std::fs::remove_file(&path);
+    let out = out.ok()?;
+    assert!(
+        out.status.success(),
+        "{name}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let pcm: Vec<f32> = out
+        .stdout
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    Some(
+        (0..nch)
+            .map(|c| pcm.iter().skip(c).step_by(nch).copied().collect())
+            .collect(),
+    )
+}
+
+/// A 2.0 signal whose coupled band is anti-phase, a 15 kHz tone in L and its negative in R
+/// over a shared 440 Hz one: L + R cancels it, so the band's phase flag sets and the
+/// coupling channel carries L − R; oxideav and ffmpeg both rebuild each channel within the
+/// coordinates' step. Without the flag the band is lost: 3.0 dB in either channel.
+#[test]
+fn an_anti_phase_band_survives_coupling() {
+    let config = Config::new(Codec::Ac3, Layout::Stereo, 192).unwrap();
+    let pcm: Vec<f32> = (0..12 * 1536)
+        .flat_map(|i| {
+            let t = i as f32 / 48_000.0;
+            let low = 0.3 * (std::f32::consts::TAU * 440.0 * t).sin();
+            let high = 0.3 * (std::f32::consts::TAU * 15_000.0 * t).sin();
+            [low + high, low - high]
+        })
+        .collect();
+    let frames = encode(config, &pcm, 240);
+    for (_, f) in &frames {
+        let si = syncinfo::parse(f).unwrap();
+        let b = bsi::parse(&f[5..]).unwrap();
+        let side = audblk::parse_frame_side_info(&si, &b, f).unwrap();
+        assert!(side[0].phsflginu);
+    }
+    let stream: Vec<u8> = frames.iter().flat_map(|(_, f)| f.clone()).collect();
+    let decoders = [
+        Some(decode(&frames, 2)),
+        ffmpeg_decode(&stream, 2, "phase.ac3"),
+    ];
+    for (name, got) in ["oxideav", "ffmpeg"].iter().zip(decoders) {
+        let Some(got) = got else { continue };
+        for (c, got) in got.iter().enumerate() {
+            let want: Vec<f32> = pcm.iter().skip(c).step_by(2).copied().collect();
+            let range = 1536..11 * 1536;
+            let snr = snr_db(&want[range.clone()], &got[range]);
+            assert!(snr > 20.0, "{name} channel {c}: {snr:.1} dB");
+            println!("{name} channel {c}: {snr:.1} dB");
+        }
+    }
+}

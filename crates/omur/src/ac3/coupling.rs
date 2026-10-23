@@ -70,6 +70,12 @@ pub(crate) struct Frame {
     pub(crate) send: [[bool; MAX_FBW]; 6],
     /// The coordinates a block sends where `send` is set.
     pub(crate) coords: [[Coords; MAX_FBW]; 6],
+    /// `phsflginu`: 2/0 only, set when any block of the frame flags a band.
+    pub(crate) phased: bool,
+    /// `phsflg[bnd]` in effect in each block: the coupling channel of a flagged band is L − R,
+    /// and the decoder negates R's reconstruction there. A block whose flags differ from
+    /// the block before sends both channels' coordinates, and the flags with them.
+    pub(crate) phase: [[bool; MAX_BANDS]; 6],
 }
 
 impl Frame {
@@ -78,8 +84,49 @@ impl Frame {
             bands,
             send: [[false; MAX_FBW]; 6],
             coords: [[Coords::default(); MAX_FBW]; 6],
+            phased: false,
+            phase: [[false; MAX_BANDS]; 6],
         }
     }
+}
+
+/// How much of a band's energy `L + R` must cancel, `−2ΣLR / (ΣL² + ΣR²)`, to set its
+/// flag, and how much `L − R` would, to clear it; between, the flag holds from the block
+/// before, and block 0 starts clear. Unrelated content, or one channel alone, sums as well
+/// either way and leaves the flags, and their bits, off.
+const FLIP: f32 = 0.5;
+
+/// Each block's phase flags for a 2/0 pair `l`, `r` over the coupling bands ending at
+/// `edges`, from `start`, by the sign of each band's cross-spectrum past `FLIP`.
+fn phase_flags(
+    l: &[[f32; 256]; 6],
+    r: &[[f32; 256]; 6],
+    start: usize,
+    edges: &[usize; MAX_BANDS],
+    n: usize,
+    blocks: usize,
+) -> [[bool; MAX_BANDS]; 6] {
+    let mut out = [[false; MAX_BANDS]; 6];
+    for b in 0..blocks {
+        let mut lo = start;
+        for k in 0..n {
+            let (mut x, mut el, mut er) = (0f32, 0f32, 0f32);
+            for (a, c) in l[b][lo..edges[k]].iter().zip(&r[b][lo..edges[k]]) {
+                x += a * c;
+                el += a * a;
+                er += c * c;
+            }
+            let corr = 2.0 * x / (el + er).max(f32::MIN_POSITIVE);
+            out[b][k] = match b {
+                _ if corr < -FLIP => true,
+                _ if corr > FLIP => false,
+                0 => false,
+                _ => out[b - 1][k],
+            };
+            lo = edges[k];
+        }
+    }
+    out
 }
 
 /// The grid a coordinate is chosen on: index `16·e + 15 − m` stands for `(16 + m)/32 · 2^-e`,
@@ -144,8 +191,9 @@ const PEAK: f32 = 0.98;
 /// Forms the coupling channel of the frame's first `blocks` blocks into `cpl`, the sum of
 /// `coef[..nf]` over the coupling range, and decides `frame`'s coordinates from each band's
 /// energy ratio. The sum, not the average, keeps the channel clear of the hearing threshold
-/// at the top of the band. A channel's coordinates hold from block to block while every
-/// band stays within `MOVE_STEPS` of the run's ratio, energies summed over the run.
+/// at the top of the band; a 2/0 band whose phase flag is set sums L − R. A channel's
+/// coordinates hold from block to block while every band stays within `MOVE_STEPS` of the
+/// run's ratio, energies summed over the run, and the flags hold.
 pub(crate) fn form(
     coef: &[[[f32; 256]; 6]],
     cpl: &mut [[f32; 256]; 6],
@@ -158,6 +206,11 @@ pub(crate) fn form(
     let n = bands.count().min(MAX_BANDS);
     let edges = bands.edges();
     let nf = coef.len().min(MAX_FBW);
+    frame.phase = match coef {
+        [l, r] => phase_flags(l, r, start, &edges, n, blocks),
+        _ => [[false; MAX_BANDS]; 6],
+    };
+    frame.phased = frame.phase[..blocks].iter().flatten().any(|f| *f);
     let mut energy = [[0f32; MAX_BANDS]; 6];
     let mut own = [[[0f32; MAX_BANDS]; 6]; MAX_FBW];
     for b in 0..blocks {
@@ -166,6 +219,22 @@ pub(crate) fn form(
         for c in coef.iter().take(nf) {
             for (o, v) in out[start..end].iter_mut().zip(&c[b][start..end]) {
                 *o += v;
+            }
+        }
+        if let [l, r] = coef {
+            // a flagged band carries L − R: the sum with R taken back twice
+            let mut lo = start;
+            for (k, hi) in edges.iter().enumerate().take(n) {
+                if frame.phase[b][k] {
+                    for ((o, a), c) in out[lo..*hi]
+                        .iter_mut()
+                        .zip(&l[b][lo..*hi])
+                        .zip(&r[b][lo..*hi])
+                    {
+                        *o = a - c;
+                    }
+                }
+                lo = *hi;
             }
         }
         let peak = out[start..end].iter().fold(0f32, |m, v| m.max(v.abs()));
@@ -199,7 +268,7 @@ pub(crate) fn form(
         let (mut acc_own, mut acc_cpl) = (own[0], energy[0]);
         for b in 1..=blocks {
             let run = ratio(&acc_own, &acc_cpl);
-            let moved = b == blocks || {
+            let moved = b == blocks || frame.phase[b] != frame.phase[b - 1] || {
                 let here = ratio(&own[b], &energy[b]);
                 here.iter()
                     .zip(&run)
@@ -296,6 +365,49 @@ mod tests {
             (133, 217, 7, 3)
         );
         assert_eq!(b.edges()[..3], [145, 181, 217]);
+    }
+
+    /// A band flags when L + R would cancel past `FLIP`, clears when L − R would, and holds
+    /// between; a band with one channel alone never flags.
+    #[test]
+    fn phase_flags_follow_the_cross_spectrum() {
+        let bands = Bands {
+            begf: 8,
+            endf: 12,
+            strc: 0b110_1100,
+        };
+        let (start, edges) = (bands.start(), bands.edges());
+        let mut l = [[0f32; 256]; 6];
+        let mut r = [[0f32; 256]; 6];
+        // band 0 anti-phase in blocks 0-2, in phase after; band 1 R alone; band 2 anti-phase
+        // in block 0, then 30% correlated in block 1 (between the thresholds)
+        for b in 0..6 {
+            for i in 0..256 {
+                let x = ((i * 31 + b * 7) % 17) as f32 / 17.0 - 0.5;
+                let y = ((i * 13 + b * 5) % 11) as f32 / 11.0 - 0.5;
+                l[b][i] = x;
+                r[b][i] = match i {
+                    _ if i < edges[0] => {
+                        if b < 3 {
+                            -x
+                        } else {
+                            x
+                        }
+                    }
+                    _ if i < edges[1] => {
+                        l[b][i] = 0.0;
+                        x
+                    }
+                    _ if b == 0 => -x,
+                    _ => 0.3 * x + y,
+                };
+            }
+        }
+        let f = phase_flags(&l, &r, start, &edges, bands.count(), 6);
+        let column = |k: usize| f.map(|b| b[k]);
+        assert_eq!(column(0), [true, true, true, false, false, false]);
+        assert_eq!(column(1), [false; 6]);
+        assert!(column(2)[0] && column(2)[1], "{:?}", column(2));
     }
 
     #[test]

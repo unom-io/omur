@@ -155,7 +155,8 @@ impl Config {
 
     /// Bytes of the independent syncframe, then of the dependent one (0 but on 7.1). 7.1
     /// splits the rate 7:5 by coded channels: 5.1 and a coupling channel, against four
-    /// channels and one. Each is 4,096 bytes at most on the ladder.
+    /// channels and one. Of 2:1, 3:2, 5:3 and 7:5, 7:5 keeps the probe signal's weakest
+    /// channel highest at 768 and 1,024 kbit/s. Each is 4,096 bytes at most on the ladder.
     fn syncframe_bytes(&self) -> [usize; 2] {
         // words = kbps · 1000 · samples / 48000 / 16 of the share num/den, to the nearest
         let words = |num: usize, den: usize| {
@@ -274,7 +275,17 @@ fn read(sample: &[f32], slot: usize) -> f32 {
 
 /// Copies `chunk`'s samples of `src` into `dst`.
 fn copy_in(dst: &mut [f32], chunk: &[f32], channels: usize, src: Source) {
-    let samples = chunk.chunks_exact(channels);
+    match channels {
+        2 => copy_from::<2>(dst, chunk, src),
+        6 => copy_from::<6>(dst, chunk, src),
+        8 => copy_from::<8>(dst, chunk, src),
+        _ => {}
+    }
+}
+
+/// `copy_in` for `C` channels a sample.
+fn copy_from<const C: usize>(dst: &mut [f32], chunk: &[f32], src: Source) {
+    let samples = chunk.as_chunks::<C>().0;
     match src {
         Source::Wav(slot) => {
             for (d, s) in dst.iter_mut().zip(samples) {

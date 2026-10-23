@@ -30,24 +30,71 @@ pub(crate) const MAX_END: usize = 253;
 pub(crate) const MAX_SLOTS: usize = 7;
 
 /// The frame's SNR offsets: coarse, and fine per slot (`fsnroffst`, `lfefsnroffst`,
-/// `cplfsnroffst`, in the encoder's slot order).
+/// `cplfsnroffst`, in the encoder's slot order); on E-AC-3, the fast gain codes when the
+/// frame sends any (`frmfgaincode`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Offsets {
     pub(crate) csnr: u8,
     pub(crate) fsnr: [u8; MAX_SLOTS],
+    pub(crate) gains: Option<Gains>,
+}
+
+/// E-AC-3's fast gain codes of each block per slot, and the blocks that send them
+/// (`fgaincode`). A block that sends none decodes at `FGAINCOD`, as the syntax has it;
+/// ffmpeg 9.0.1 keeps the last codes it read instead, so a block after one with other
+/// codes sends its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Gains {
+    pub(crate) codes: [[u8; MAX_SLOTS]; 6],
+    pub(crate) sent: [bool; 6],
+}
+
+impl Gains {
+    /// The codes `gain[slot][block]` of a frame of `blocks` blocks, sent where they or
+    /// the block's before differ from `FGAINCOD`; `after` when the last block before the
+    /// frame did. `None` when no block sends.
+    pub(crate) fn of(gain: &[[u8; 6]], blocks: usize, after: bool) -> Option<Gains> {
+        let mut g = Gains {
+            codes: [[FGAINCOD; MAX_SLOTS]; 6],
+            sent: [false; 6],
+        };
+        let mut before = after;
+        for b in 0..blocks.min(6) {
+            for (code, slot) in g.codes[b].iter_mut().zip(gain) {
+                *code = slot[b];
+            }
+            let own = g.codes[b].iter().any(|c| *c != FGAINCOD);
+            g.sent[b] = own || before;
+            before = own;
+        }
+        g.sent.iter().any(|s| *s).then_some(g)
+    }
+
+    /// Whether the frame's last block leaves a decoder at codes other than `FGAINCOD`.
+    pub(crate) fn last_differs(gains: Option<&Gains>, blocks: usize) -> bool {
+        gains.is_some_and(|g| {
+            g.codes[blocks.clamp(1, 6) - 1]
+                .iter()
+                .any(|c| *c != FGAINCOD)
+        })
+    }
 }
 
 /// One channel's allocation over a frame of `blocks` blocks, bins `start..end`. Each
 /// exponent set lives at the block that sends it; `set[b]` names the block whose set block
-/// `b` uses.
+/// `b` uses. A set whose blocks take different fast gain codes splits where they change,
+/// each part a set of its own with the exponents copied.
 pub(crate) struct Alloc {
     /// Exponents as the decoder rebuilds them.
     pub(crate) exp: [[u8; 256]; 6],
     pub(crate) psd: [[i16; 256]; 6],
-    /// The masking curve before the SNR offset.
+    pub(crate) bndpsd: [[i32; 50]; 6],
+    /// The masking curve before the SNR offset, at the set's fast gain code.
     pub(crate) mask: [[i16; 50]; 6],
     pub(crate) bap: [[u8; 256]; 6],
     pub(crate) set: [usize; 6],
+    /// Each block's fast gain code: `FGAINCOD` but where E-AC-3's climb moves it.
+    pub(crate) gain: [u8; 6],
     pub(crate) start: usize,
     pub(crate) end: usize,
     pub(crate) blocks: usize,
@@ -58,13 +105,55 @@ impl Alloc {
         Alloc {
             exp: [[24; 256]; 6],
             psd: [[0; 256]; 6],
+            bndpsd: [[0; 50]; 6],
             mask: [[0; 50]; 6],
             bap: [[0; 256]; 6],
             set: [0; 6],
+            gain: [FGAINCOD; 6],
             start,
             end,
             blocks,
         }
+    }
+
+    /// Set `s`'s psd, banded psd and masking curve at `FGAINCOD`, from its exponents.
+    pub(crate) fn analyse(&mut self, s: usize) {
+        if let (Some(exp), Some(psd), Some(bnd), Some(mask)) = (
+            self.exp.get(s),
+            self.psd.get_mut(s),
+            self.bndpsd.get_mut(s),
+            self.mask.get_mut(s),
+        ) {
+            curve(exp, self.start, self.end, FGAINCOD, psd, bnd, mask);
+        }
+        if let Some(g) = self.gain.get_mut(s) {
+            *g = FGAINCOD;
+        }
+    }
+
+    /// Gives block `b` its fast gain code `gain[b]`, splitting the sets where the code
+    /// changes inside one; a part copies its set's exponents and takes its own mask.
+    pub(crate) fn regroup(&mut self, gain: &[u8; 6]) {
+        let n = self.blocks.min(6);
+        let sets = self.set;
+        for b in 0..n {
+            let s = sets[b];
+            if b == s || gain[b] != gain[b - 1] {
+                if b != s {
+                    self.exp[b] = self.exp[s];
+                    self.psd[b] = self.psd[s];
+                    self.bndpsd[b] = self.bndpsd[s];
+                }
+                if b != s || gain[b] != self.gain[b] {
+                    let (start, end) = (self.start, self.end);
+                    masking(&self.bndpsd[b], start, end, gain[b], &mut self.mask[b]);
+                }
+                self.set[b] = b;
+            } else {
+                self.set[b] = self.set[b - 1];
+            }
+        }
+        self.gain = *gain;
     }
 }
 
@@ -93,24 +182,26 @@ fn lowcomp(a: i32, b0: i32, b1: i32, band: usize) -> i32 {
     }
 }
 
-/// `psd` per bin and the masking curve per band, before the SNR offset, for the exponents
-/// `exp[start..end]`: a full-bandwidth or LFE channel from bin 0 with low-band
-/// compensation, the coupling channel from its start with the leak initialisation.
+/// `psd` per bin, the banded `bndpsd` and the masking curve per band, before the SNR
+/// offset, for the exponents `exp[start..end]` at fast gain code `fgaincod`: a
+/// full-bandwidth or LFE channel from bin 0 with low-band compensation, the coupling channel
+/// from its start with the leak initialisation.
 pub(crate) fn curve(
     exp: &[u8; 256],
     start: usize,
     end: usize,
+    fgaincod: u8,
     psd: &mut [i16; 256],
+    bndpsd: &mut [i32; 50],
     mask: &mut [i16; 50],
 ) {
     let end = end.min(MAX_END);
     if start >= end {
         return;
     }
-    for (p, e) in psd.iter_mut().zip(exp).take(end).skip(start) {
+    for (p, e) in psd[start..end].iter_mut().zip(&exp[start..end]) {
         *p = (3072 - (i32::from(*e) << 7)) as i16;
     }
-    let mut bndpsd = [0i32; 50];
     let mut bin = start;
     let mut band = MASKTAB[start] as usize;
     while bin < end {
@@ -123,10 +214,25 @@ pub(crate) fn curve(
         bin = last;
         band += 1;
     }
+    masking(bndpsd, start, end, fgaincod, mask);
+}
 
+/// The masking curve over the bands of `start..end` from their `bndpsd` at fast gain code
+/// `fgaincod`: the excitation's fast and slow leaks, the knee and the hearing threshold.
+pub(crate) fn masking(
+    bndpsd: &[i32; 50],
+    start: usize,
+    end: usize,
+    fgaincod: u8,
+    mask: &mut [i16; 50],
+) {
+    let end = end.min(MAX_END);
+    if start >= end {
+        return;
+    }
     let bndstrt = MASKTAB[start] as usize;
     let bndend = MASKTAB[end - 1] as usize + 1;
-    let fgain = FASTGAIN[FGAINCOD as usize];
+    let fgain = FASTGAIN[usize::from(fgaincod & 7)];
     let sgain = SLOWGAIN[SGAINCOD as usize];
     let fdecay = FASTDEC[FDCYCOD as usize];
     let sdecay = SLOWDEC[SDCYCOD as usize];
@@ -198,8 +304,8 @@ pub(crate) fn for_each_address(
     while bin < end {
         let last = (BNDTAB[band] as usize + BNDSZ[band] as usize).min(end);
         let m = ((i32::from(mask[band]) - offset - floor).max(0) & 0x1fe0) + floor;
-        for (i, p) in psd.iter().enumerate().take(last).skip(bin) {
-            f(i, ((i32::from(*p) - m) >> 5).clamp(0, 63) as usize);
+        for (i, p) in psd.get(bin..last).unwrap_or_default().iter().enumerate() {
+            f(bin + i, ((i32::from(*p) - m) >> 5).clamp(0, 63) as usize);
         }
         bin = last;
         band += 1;
@@ -230,6 +336,7 @@ mod tests {
         start: usize,
         end: usize,
         snroffset: i32,
+        fgaincod: u8,
     ) -> (Vec<i32>, [i32; 50], Vec<u8>) {
         let mut lowcomp = 0i32;
         let sdecay = SLOWDEC[SDCYCOD as usize];
@@ -237,7 +344,7 @@ mod tests {
         let sgain = SLOWGAIN[SGAINCOD as usize];
         let dbknee = DBPBTAB[DBPBCOD as usize];
         let floor = FLOORTAB[FLOORCOD as usize];
-        let fgain = FASTGAIN[FGAINCOD as usize];
+        let fgain = FASTGAIN[fgaincod as usize];
         let psd: Vec<i32> = exp.iter().map(|e| 3072 - ((*e as i32) << 7)).collect();
         let logadd = |a: i32, b: i32| {
             let c = a - b;
@@ -390,17 +497,80 @@ mod tests {
         ]
     }
 
+    /// A block sends codes where they or its predecessor's differ from the default; the
+    /// frame sends none when no block does.
+    #[test]
+    fn gains_reset_after_a_raised_block() {
+        let mut gain = [[FGAINCOD; 6]; 3];
+        assert_eq!(Gains::of(&gain, 6, false), None);
+        let g = Gains::of(&gain, 6, true).unwrap();
+        assert_eq!(g.sent, [true, false, false, false, false, false]);
+        gain[1][1] = 5;
+        gain[2][4] = 5;
+        let g = Gains::of(&gain, 6, false).unwrap();
+        assert_eq!(g.sent, [false, true, true, false, true, true]);
+        assert_eq!(
+            (g.codes[1][1], g.codes[4][2], g.codes[4][1]),
+            (5, 5, FGAINCOD)
+        );
+        assert!(!Gains::last_differs(Some(&g), 6));
+        assert!(Gains::last_differs(Some(&g), 5));
+    }
+
+    /// A set whose blocks take two codes splits into two sets with the same exponents,
+    /// each masked at its own code.
+    #[test]
+    fn regroup_splits_sets_where_the_code_changes() {
+        let (start, end) = (0, 253);
+        let mut a = Alloc::new(start, end, 6);
+        a.set = [0, 0, 0, 3, 3, 3];
+        for s in [0, 3] {
+            for (i, e) in a.exp[s].iter_mut().enumerate() {
+                *e = (3 + (i % 7) as u8 + s as u8).min(24);
+            }
+            a.analyse(s);
+        }
+        a.regroup(&[5, 5, 4, 4, 4, 5]);
+        assert_eq!(a.set, [0, 0, 2, 3, 3, 5]);
+        for (s, code, from) in [(0, 5, 0), (2, 4, 0), (3, 4, 3), (5, 5, 3)] {
+            assert_eq!(a.exp[s], a.exp[from], "set {s}");
+            let (mut psd, mut mask) = ([0i16; 256], [0i16; 50]);
+            curve(
+                &a.exp[s],
+                start,
+                end,
+                code,
+                &mut psd,
+                &mut [0; 50],
+                &mut mask,
+            );
+            assert_eq!((a.psd[s], a.mask[s]), (psd, mask), "set {s}");
+        }
+    }
+
+    /// Each set at one of the fast gain codes 4, 7, 0 and 5 in turn.
     #[test]
     fn mask_and_bap_match_the_printed_pseudo_code() {
-        for (set, start, end) in exponent_sets() {
+        for ((set, start, end), fgaincod) in
+            exponent_sets().into_iter().zip([4, 7, 0, 5].iter().cycle())
+        {
             let mut exp = [24u8; 256];
             exp[..end].copy_from_slice(&set[..end]);
             let mut psd = [0i16; 256];
             let mut mask = [0i16; 50];
-            curve(&exp, start, end, &mut psd, &mut mask);
+            curve(
+                &exp,
+                start,
+                end,
+                *fgaincod,
+                &mut psd,
+                &mut [0; 50],
+                &mut mask,
+            );
             for (csnr, fsnr) in [(0, 1), (8, 0), (15, 0), (22, 7), (40, 15), (63, 15)] {
                 let offset = snr_offset(csnr, fsnr);
-                let (want_psd, want_mask, want_bap) = spec(&exp[..end], start, end, offset);
+                let (want_psd, want_mask, want_bap) =
+                    spec(&exp[..end], start, end, offset, *fgaincod);
                 let bndend = MASKTAB[end - 1] as usize + 1;
                 for b in MASKTAB[start] as usize..bndend {
                     assert_eq!(mask[b] as i32, want_mask[b], "{start}..{end} band {b}");

@@ -118,27 +118,36 @@ pub(crate) fn encode(
     decoded: &mut [u8; 256],
 ) {
     let size = group_size(strategy);
+    let shift = size.trailing_zeros();
     let count = group_count(strategy, start, end).min(MAX_GROUPS);
     let n = 3 * count;
     let first = start.max(1);
-    // v[0] is the absolute exponent; v[1..=n] the mapped values, each over `size` bins.
+    let end = end.min(256);
+    // v[0] is the absolute exponent; v[1..=n] the mapped values, each over `size` bins:
+    // the whole spans first, then a part one, then the last value again past the end
     let mut v = [0u8; 3 * MAX_GROUPS + 1];
     v[0] = env[0].min(15);
-    for k in 1..=n {
-        let lo = first + (k - 1) * size;
-        let hi = (lo + size).min(end);
-        v[k] = env
-            .get(lo..hi)
-            .and_then(|s| s.iter().min().copied())
-            .unwrap_or(v[k - 1]);
+    let bins = env.get(first..end.max(first)).unwrap_or_default();
+    let whole = (bins.len() >> shift).min(n);
+    match size {
+        1 => v[1..=whole].copy_from_slice(&bins[..whole]),
+        2 => {
+            for (o, p) in v[1..=whole].iter_mut().zip(bins.as_chunks::<2>().0) {
+                *o = p[0].min(p[1]);
+            }
+        }
+        _ => {
+            for (o, q) in v[1..=whole].iter_mut().zip(bins.as_chunks::<4>().0) {
+                *o = q[0].min(q[1]).min(q[2].min(q[3]));
+            }
+        }
+    }
+    for k in whole + 1..=n {
+        let part = bins.get((k - 1) << shift..).unwrap_or_default();
+        v[k] = part.iter().take(size).min().copied().unwrap_or(v[k - 1]);
     }
     let coupled = start > 0;
-    for k in 1 + usize::from(coupled)..=n {
-        v[k] = v[k].min(v[k - 1] + 2);
-    }
-    for k in (usize::from(coupled)..n).rev() {
-        v[k] = v[k].min(v[k + 1] + 2);
-    }
+    slope_limit(&mut v[usize::from(coupled)..=n]);
     if coupled {
         v[0] = v[1] & !1;
     }
@@ -151,8 +160,31 @@ pub(crate) fn encode(
     if !coupled {
         decoded[0] = v[0];
     }
-    for bin in first..end.min(256) {
-        decoded[bin] = v[(1 + (bin - first) / size).min(n)];
+    // each value over its `size` bins, the last one on to the end
+    let spans = decoded.get_mut(first..end.max(first)).unwrap_or_default();
+    let mut rest = spans.chunks_mut(size).zip(&v[1..=n]);
+    for (d, value) in &mut rest {
+        d.fill(*value);
+    }
+    let done = (n * size).min(spans.len());
+    spans[done..].fill(v[n]);
+}
+
+/// Limits every step of `v` to ±2 by lowering values, never raising one: up the slice,
+/// each at most 2 over the one before, then down it, each at most 2 over the one after
+/// (§8.2.10). As prefix minima of `v[j] ∓ 2j`, so no step waits on the last.
+fn slope_limit(v: &mut [u8]) {
+    let mut w = [0i16; 3 * MAX_GROUPS + 1];
+    let w = &mut w[..v.len()];
+    let mut low = i16::MAX;
+    for (k, (w, x)) in w.iter_mut().zip(v.iter()).enumerate() {
+        low = low.min(i16::from(*x) - 2 * k as i16);
+        *w = low + 2 * k as i16;
+    }
+    let mut low = i16::MAX;
+    for (k, (x, w)) in v.iter_mut().zip(w.iter()).enumerate().rev() {
+        low = low.min(*w + 2 * k as i16);
+        *x = (low - 2 * k as i16) as u8;
     }
 }
 

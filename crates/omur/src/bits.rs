@@ -6,14 +6,15 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Overflow;
 
-/// MSB-first writer over a byte slice. Bits gather in a 64-bit accumulator and are stored
-/// 32 at a time; `finish` stores the rest, zero-padded.
+/// MSB-first writer over a byte slice. Bits gather from the top of a 64-bit accumulator;
+/// every put stores its top 32 bits at the current word and steps past it once all 32 are
+/// in, so a full word costs no branch. `finish` stores the rest, zero-padded.
 pub(crate) struct BitWriter<'a> {
     buf: &'a mut [u8],
-    /// Bytes stored so far.
+    /// Bytes stored for good so far.
     byte: usize,
     acc: u64,
-    /// Bits held in `acc`, below 32 between calls.
+    /// Bits held at the top of `acc`, below 32 between calls.
     held: u32,
 }
 
@@ -32,22 +33,49 @@ impl<'a> BitWriter<'a> {
         self.byte * 8 + self.held as usize
     }
 
+    /// Appends the low `bits` bits of `value`, `bits` at most 32, with the room checked.
+    #[inline(always)]
+    fn push(&mut self, value: u32, bits: u32) {
+        let mask = (1u64 << bits) - 1;
+        // held < 32 and bits <= 32 keep the shift under 64 but for 0 bits, whose value is 0
+        self.acc |= (u64::from(value) & mask).wrapping_shl(64 - self.held - bits);
+        self.held += bits;
+        if let Some(dst) = self.buf.get_mut(self.byte..self.byte + 4) {
+            dst.copy_from_slice(&((self.acc >> 32) as u32).to_be_bytes());
+        }
+        let full = self.held >> 5;
+        self.byte += 4 * full as usize;
+        self.acc <<= 32 * full;
+        self.held -= 32 * full;
+    }
+
     /// Writes the low `bits` bits of `value`, `bits` at most 32.
     #[inline]
     pub(crate) fn put(&mut self, value: u32, bits: u32) -> Result<(), Overflow> {
-        if self.position() + bits as usize > self.buf.len() * 8 {
+        if bits > 32 || self.position() + bits as usize > self.buf.len() * 8 {
             return Err(Overflow);
         }
-        let mask = (1u64 << bits) - 1;
-        self.acc = (self.acc << bits) | (u64::from(value) & mask);
-        self.held += bits;
-        if self.held >= 32 {
-            self.held -= 32;
-            let word = (self.acc >> self.held) as u32;
-            if let Some(dst) = self.buf.get_mut(self.byte..self.byte + 4) {
-                dst.copy_from_slice(&word.to_be_bytes());
-            }
-            self.byte += 4;
+        self.push(value, bits);
+        Ok(())
+    }
+
+    /// Writes `code[i]` in `bits[i]` bits for every `i`, each 16 bits at most, two to a put.
+    pub(crate) fn put_all(&mut self, code: &[u16], bits: &[u8]) -> Result<(), Overflow> {
+        let total: usize = bits.iter().map(|b| usize::from(*b)).sum();
+        if bits.iter().any(|b| *b > 16) || self.position() + total > self.buf.len() * 8 {
+            return Err(Overflow);
+        }
+        let field = |v: u16, n: u8| u32::from(v) & ((1u32 << n) - 1);
+        let mut pairs = code.chunks_exact(2).zip(bits.chunks_exact(2));
+        for (v, n) in &mut pairs {
+            let (n0, n1) = (n[0], n[1]);
+            let both = (field(v[0], n0) << n1) | field(v[1], n1);
+            self.push(both, u32::from(n0) + u32::from(n1));
+        }
+        if let (Some(v), Some(n)) = (code.get(bits.len() & !1), bits.last())
+            && bits.len() % 2 == 1
+        {
+            self.push(u32::from(*v), u32::from(*n));
         }
         Ok(())
     }
@@ -66,11 +94,11 @@ impl<'a> BitWriter<'a> {
     pub(crate) fn finish(mut self) -> usize {
         while self.held > 0 {
             let take = self.held.min(8);
-            self.held -= take;
-            let byte = ((self.acc >> self.held) << (8 - take)) as u8;
             if let Some(b) = self.buf.get_mut(self.byte) {
-                *b = byte;
+                *b = (self.acc >> 56) as u8;
             }
+            self.acc <<= 8;
+            self.held -= take;
             self.byte += 1;
         }
         self.byte
@@ -100,10 +128,42 @@ const CRC_TABLE: [u16; 256] = {
     t
 };
 
+/// `CRC_TABLE` past `k` zero bytes at row `k`: what a byte contributes eight bytes at a
+/// time, row 7 for the first of them.
+const CRC_SLICES: [[u16; 256]; 8] = {
+    let mut t = [CRC_TABLE; 8];
+    let mut k = 1;
+    while k < 8 {
+        let mut i = 0;
+        while i < 256 {
+            let c = t[k - 1][i];
+            t[k][i] = (c << 8) ^ CRC_TABLE[(c >> 8) as usize];
+            i += 1;
+        }
+        k += 1;
+    }
+    t
+};
+
 /// CRC-16 of `data`, register cleared, MSB first: the value that, appended, leaves the
-/// register at zero.
+/// register at zero. Eight bytes a step: the register folds into the first two, and the
+/// CRC is linear in the rest.
 pub(crate) fn crc16(data: &[u8]) -> u16 {
-    data.iter().fold(0u16, |c, &b| {
+    let t = &CRC_SLICES;
+    let mut words = data.chunks_exact(8);
+    let mut c = 0u16;
+    for k in &mut words {
+        let row = |r: usize, b: u8| t[r][usize::from(b)];
+        c = row(7, k[0] ^ (c >> 8) as u8)
+            ^ row(6, k[1] ^ c as u8)
+            ^ row(5, k[2])
+            ^ row(4, k[3])
+            ^ row(3, k[4])
+            ^ row(2, k[5])
+            ^ row(1, k[6])
+            ^ row(0, k[7]);
+    }
+    words.remainder().iter().fold(c, |c, &b| {
         (c << 8) ^ CRC_TABLE[usize::from((c >> 8) as u8 ^ b)]
     })
 }
@@ -167,6 +227,14 @@ mod tests {
     fn crc16_matches_the_check_value() {
         // CRC-16 over 0x8005, cleared, unreflected: the catalogue's "CRC-16/UMTS".
         assert_eq!(crc16(b"123456789"), 0xfee8);
+        // every length past a whole number of eight-byte steps
+        let data: Vec<u8> = (0..40u32).map(|i| (i * 89 + 7) as u8).collect();
+        for n in 0..data.len() {
+            let bytewise = data[..n].iter().fold(0u16, |c, &b| {
+                (c << 8) ^ CRC_TABLE[usize::from((c >> 8) as u8 ^ b)]
+            });
+            assert_eq!(crc16(&data[..n]), bytewise, "{n}");
+        }
     }
 
     #[test]

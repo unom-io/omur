@@ -19,27 +19,59 @@ use crate::tables_gen::{
     PRE_LONG_RE, PRE_SHORT_IM, PRE_SHORT_RE, WINDOW,
 };
 
-/// In-place radix-2 FFT, `X[k] = Σ x[n]·exp(-2πikn/N)`, on input already in bit-reversed
-/// order. N is 64 or 128; the twiddles come from the 128-point table.
-fn fft<const N: usize>(re: &mut [f32; N], im: &mut [f32; N]) {
-    let mut half = 1;
-    while half < N {
-        let stride = 64 / half;
-        let mut base = 0;
-        while base < N {
-            for j in 0..half {
-                let (wr, wi) = (FFT_RE[j * stride], FFT_IM[j * stride]);
-                let (a, b) = (base + j, base + j + half);
-                let tr = wr * re[b] - wi * im[b];
-                let ti = wr * im[b] + wi * re[b];
-                re[b] = re[a] - tr;
-                im[b] = im[a] - ti;
-                re[a] += tr;
-                im[a] += ti;
-            }
-            base += 2 * half;
+/// The twiddles of each FFT stage side by side: stage `h` (1, 2, 4 … 64) reads
+/// `exp(-iπj/h)` for `j < h` at `h + j`.
+const STAGE_RE: [f32; 128] = stage(&FFT_RE);
+const STAGE_IM: [f32; 128] = stage(&FFT_IM);
+
+const fn stage(t: &[f32; 64]) -> [f32; 128] {
+    let mut out = [0f32; 128];
+    let mut h = 1;
+    while h < 128 {
+        let mut j = 0;
+        while j < h {
+            out[h + j] = t[j * (64 / h)];
+            j += 1;
         }
-        half *= 2;
+        h *= 2;
+    }
+    out
+}
+
+/// One radix-2 stage over butterflies `H` apart.
+#[inline(always)]
+fn butterflies<const H: usize>(re: &mut [f32], im: &mut [f32]) {
+    let (wr, wi) = (&STAGE_RE[H..2 * H], &STAGE_IM[H..2 * H]);
+    for (re, im) in re.chunks_exact_mut(2 * H).zip(im.chunks_exact_mut(2 * H)) {
+        let (ra, rb) = re.split_at_mut(H);
+        let (ia, ib) = im.split_at_mut(H);
+        for (((ra, rb), (ia, ib)), (wr, wi)) in ra
+            .iter_mut()
+            .zip(rb.iter_mut())
+            .zip(ia.iter_mut().zip(ib.iter_mut()))
+            .zip(wr.iter().zip(wi))
+        {
+            let tr = wr * *rb - wi * *ib;
+            let ti = wr * *ib + wi * *rb;
+            *rb = *ra - tr;
+            *ib = *ia - ti;
+            *ra += tr;
+            *ia += ti;
+        }
+    }
+}
+
+/// In-place radix-2 FFT, `X[k] = Σ x[n]·exp(-2πikn/N)`, on input already in bit-reversed
+/// order. N is 64 or 128.
+fn fft<const N: usize>(re: &mut [f32; N], im: &mut [f32; N]) {
+    butterflies::<1>(re, im);
+    butterflies::<2>(re, im);
+    butterflies::<4>(re, im);
+    butterflies::<8>(re, im);
+    butterflies::<16>(re, im);
+    butterflies::<32>(re, im);
+    if N > 64 {
+        butterflies::<64>(re, im);
     }
 }
 
@@ -75,15 +107,12 @@ fn window(n: usize) -> f32 {
 
 /// The 512-point transform of `x` windowed, into 256 coefficients.
 pub(crate) fn long(x: &[f32; 512], out: &mut [f32; 256]) {
-    let mut w = [0f32; 512];
-    for n in 0..512 {
-        w[n] = x[n] * window(n);
-    }
-    // MDCT(a, b, c, d) = DCT-IV(-c_r - d, a - b_r) over 128-sample quarters.
+    // MDCT(a, b, c, d) = DCT-IV(-c_r - d, a - b_r) over 128-sample quarters, windowed
+    // on the way in: window(n) is WINDOW[n] below 256 and WINDOW[511 - n] above.
     let mut u = [0f32; 256];
     for n in 0..128 {
-        u[n] = -w[383 - n] - w[384 + n];
-        u[128 + n] = w[n] - w[255 - n];
+        u[n] = -(x[383 - n] * WINDOW[128 + n]) - x[384 + n] * WINDOW[127 - n];
+        u[128 + n] = x[n] * WINDOW[n] - x[255 - n] * WINDOW[255 - n];
     }
     dct4(
         &u,

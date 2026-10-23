@@ -15,48 +15,102 @@ const RATIO: [f32; 3] = [0.1, 0.075, 0.05];
 /// Under this peak a segment is silent and never switches.
 const SILENCE: f32 = 100.0 / 32768.0;
 
+/// Channels a filter vector runs side by side; 3/2 takes two, the fifth channel's idle
+/// lanes filtering silence.
+const LANES: usize = 4;
+const GROUPS: usize = MAX_FBW.div_ceil(LANES);
+
+type Lanes = [f32; LANES];
+
 /// The detector's state across segments and frames, per full-bandwidth channel.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Detector {
-    /// Direct form II state of each biquad: w[n-1], then w[n-2], per channel.
-    state: [[[f32; MAX_FBW]; 2]; 2],
+    /// Direct form II state of each group's biquads: w[n-1], then w[n-2], per lane.
+    state: [[[Lanes; 2]; 2]; GROUPS],
     /// The last piece's peak of each level, from the segment before.
     last: [[f32; 3]; MAX_FBW],
+}
+
+/// `HIGHPASS` as its two biquads.
+const STAGES: [[f32; 5]; 2] = {
+    let mut t = [[0f32; 5]; 2];
+    let mut i = 0;
+    while i < 10 {
+        t[i / 5][i % 5] = HIGHPASS[i];
+        i += 1;
+    }
+    t
+};
+
+/// One sample of every lane through biquad `h` in direct form II, state `s`.
+#[inline(always)]
+fn biquad(v: Lanes, s: &mut [Lanes; 2], h: &[f32; 5]) -> Lanes {
+    let [s1, s2] = *s;
+    let w: Lanes = core::array::from_fn(|c| v[c] - h[3] * s1[c] - h[4] * s2[c]);
+    *s = [w, s1];
+    core::array::from_fn(|c| h[0] * w[c] + h[1] * s1[c] + h[2] * s2[c])
 }
 
 /// The input of a channel the layout lacks.
 static SILENT: [f32; SPAN] = [0.0; SPAN];
 
+/// The high-passed peak of every piece of the first `n` blocks, per lane of `G` groups:
+/// the groups run in one loop, so their recursions overlap.
+fn filter<const G: usize>(
+    rows: &[[&[f32; SPAN]; LANES]; G],
+    state: &mut [[[Lanes; 2]; 2]; G],
+    peak: &mut [[[Lanes; GROUPS]; 4]; 6],
+    n: usize,
+) {
+    for (b, pb) in peak.iter_mut().enumerate().take(n) {
+        for (q, pk) in pb.iter_mut().enumerate() {
+            let at = BLOCK_SAMPLES * (b + 1) + 64 * q;
+            let piece: [[&[f32]; LANES]; G] = core::array::from_fn(|g| {
+                rows[g].map(|r| r.get(at..at + 64).unwrap_or(&SILENT[..64]))
+            });
+            let mut top = [[0f32; LANES]; G];
+            for i in 0..64 {
+                for g in 0..G {
+                    let mut v: Lanes =
+                        core::array::from_fn(|c| piece[g][c].get(i).copied().unwrap_or(0.0));
+                    for (sj, h) in state[g].iter_mut().zip(&STAGES) {
+                        v = biquad(v, sj, h);
+                    }
+                    top[g] = core::array::from_fn(|c| top[g][c].max(v[c].abs()));
+                }
+            }
+            pk[..G].copy_from_slice(&top);
+        }
+    }
+}
+
 impl Detector {
     /// `blksw` of the frame's first `blocks` blocks for each of `pcm`'s channels: whether the
     /// second half of the block's window, the 256 samples the frame brings in after it, holds
-    /// a transient. The channels run side by side, so their filters do not wait on each other.
+    /// a transient. The channels run four to a vector, so their filters do not wait on each
+    /// other.
     pub(crate) fn detect(&mut self, pcm: &[[f32; SPAN]], blksw: &mut [[bool; 6]], blocks: usize) {
-        let rows: [&[f32; SPAN]; MAX_FBW] = core::array::from_fn(|c| pcm.get(c).unwrap_or(&SILENT));
-        let [mut s1, mut s2] = [self.state[0], self.state[1]];
-        let k: [&[f32]; 2] = [&HIGHPASS[..5], &HIGHPASS[5..]];
-        for b in 0..blocks.min(6) {
-            let mut peak = [[0f32; MAX_FBW]; 4];
-            for (q, pk) in peak.iter_mut().enumerate() {
-                let at = BLOCK_SAMPLES * (b + 1) + 64 * q;
-                for n in at..at + 64 {
-                    let mut v: [f32; MAX_FBW] =
-                        core::array::from_fn(|c| rows[c].get(n).copied().unwrap_or(0.0));
-                    for (j, h) in k.iter().enumerate() {
-                        for c in 0..MAX_FBW {
-                            let w = v[c] - h[3] * s1[j][c] - h[4] * s2[j][c];
-                            v[c] = h[0] * w + h[1] * s1[j][c] + h[2] * s2[j][c];
-                            s2[j][c] = s1[j][c];
-                            s1[j][c] = w;
-                        }
-                    }
-                    for (p, v) in pk.iter_mut().zip(v) {
-                        *p = p.max(v.abs());
-                    }
-                }
-            }
-            for (c, sw) in blksw.iter_mut().enumerate().take(pcm.len().min(MAX_FBW)) {
-                let p3 = [peak[0][c], peak[1][c], peak[2][c], peak[3][c]];
+        let n = blocks.min(6);
+        let pcm = pcm.get(..MAX_FBW).unwrap_or(pcm);
+        let nch = pcm.len();
+        let rows: [[&[f32; SPAN]; LANES]; GROUPS] = core::array::from_fn(|g| {
+            core::array::from_fn(|c| pcm.get(LANES * g + c).unwrap_or(&SILENT))
+        });
+        let mut peak = [[[[0f32; LANES]; GROUPS]; 4]; 6];
+        if nch > LANES {
+            filter(&rows, &mut self.state, &mut peak, n);
+        } else {
+            let ([first, ..], [state, ..]) = (&rows, &mut self.state);
+            filter::<1>(
+                core::array::from_ref(first),
+                core::array::from_mut(state),
+                &mut peak,
+                n,
+            );
+        }
+        for (b, pb) in peak.iter().enumerate().take(n) {
+            for (c, sw) in blksw.iter_mut().enumerate().take(nch) {
+                let p3 = pb.map(|p| p[c / LANES][c % LANES]);
                 let p2 = [p3[0].max(p3[1]), p3[2].max(p3[3])];
                 let p1 = p2[0].max(p2[1]);
                 let last = self.last[c];
@@ -70,7 +124,6 @@ impl Detector {
                 self.last[c] = [p1, p2[1], p3[3]];
             }
         }
-        self.state = [s1, s2];
     }
 }
 
