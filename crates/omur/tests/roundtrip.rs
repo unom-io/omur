@@ -221,3 +221,18 @@ fn non_finite_input_decodes_as_silence() {
         assert!(decoder::verify_packet_crc(&f).unwrap().all_ok());
     }
 }
+
+#[test]
+fn samples_past_full_scale_clamp_to_it() {
+    let config = Config::new(Codec::Ac3, Layout::Surround51, 320).unwrap();
+    let mut pcm = signal(Layout::Surround51, 4 * 1536);
+    let mut clamped = pcm.clone();
+    for (i, (v, c)) in pcm.iter_mut().zip(clamped.iter_mut()).enumerate() {
+        if i % 997 == 0 {
+            (*v, *c) = (-1e30, -1.0);
+        } else if i % 991 == 0 {
+            (*v, *c) = (3.5, 1.0);
+        }
+    }
+    assert!(encode(config, &pcm, 240) == encode(config, &clamped, 240));
+}

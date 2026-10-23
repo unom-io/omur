@@ -252,10 +252,11 @@ impl Encoder {
     }
 
     /// Queue interleaved f32 in WAV order, at most one frame ([`Config::frame_samples`],
-    /// 1536 on AC-3) per push. Non-finite samples read as silence. A frame is encoded as
-    /// soon as [`Config::delay_samples`] have arrived past its start. [`Error::Backlog`]
-    /// refuses, and consumes nothing of, a push that would complete a frame while the last
-    /// one is unread, or complete two — which a push longer than a frame can.
+    /// 1536 on AC-3) per push. Samples are clamped to ±1.0; non-finite ones read as 0. A
+    /// frame is encoded as soon as [`Config::delay_samples`] have arrived past its start.
+    /// [`Error::Backlog`] refuses, and consumes nothing of, a push that would complete a
+    /// frame while the last one is unread, or complete two — which a push longer than a
+    /// frame can.
     pub fn push(&mut self, pcm: &[f32]) -> Result<(), Error> {
         let channels = self.config.layout.channels();
         if !pcm.len().is_multiple_of(channels) {
@@ -275,7 +276,11 @@ impl Encoder {
                 for (dst, slot) in span.iter_mut().zip(self.wav_slot) {
                     let v = sample.get(*slot).copied().unwrap_or(0.0);
                     if let Some(d) = dst.get_mut(self.fill + j) {
-                        *d = if v.is_finite() { v } else { 0.0 };
+                        *d = if v.is_finite() {
+                            v.clamp(-1.0, 1.0)
+                        } else {
+                            0.0
+                        };
                     }
                 }
             }
