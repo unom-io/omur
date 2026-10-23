@@ -6,13 +6,12 @@ pub(crate) mod coupling;
 mod transient;
 
 use crate::bitalloc::{Alloc, MAX_SLOTS, Offsets, curve};
-use crate::bits::{BitWriter, Overflow, crc_shift_back};
+use crate::bits::{BitWriter, Overflow};
 use crate::exponents::{Groups, REUSE, encode, extract, plan};
 use crate::mantissas::Mantissas;
-use crate::pack::{self, Choices, Side, Stream};
-use crate::tables::BITRATES;
+use crate::pack::{self, Choices, Side, Stream, Syntax};
 use crate::tuner::{self, Budget};
-use crate::{BLOCK_SAMPLES, Layout, mdct};
+use crate::{BLOCK_SAMPLES, Layout, eac3, mdct};
 use coupling::Bands;
 
 /// Whether transients switch blocks to the short transform pair (§8.2.2). A build-time
@@ -126,21 +125,57 @@ fn rematrix(l: &mut [[f32; 256]], r: &mut [[f32; 256]], bands: usize, top: usize
 }
 
 /// The coupling range per rate, or the bandwidth code when nothing is coupled: the
-/// choices of ffmpeg's streams, as `probe dump` reads them.
-fn coupling_plan(layout: Layout, kbps: u32) -> (Option<Bands>, u8) {
+/// choices of ffmpeg's 2.0 and 5.1 streams, as `probe dump` reads them. Other channel
+/// counts take the 5.1 range of the same rate per channel.
+fn coupling_plan(nfchans: usize, kbps: u32) -> (Option<Bands>, u8) {
     let cpl = |begf, endf, strc| (Some(Bands { begf, endf, strc }), 0);
-    match (layout, kbps) {
-        (Layout::Stereo, ..=128) => cpl(1, 6, 0b1000_0000),
-        (Layout::Stereo, ..=160) => cpl(7, 8, 0b1010),
-        (Layout::Stereo, ..=192) => cpl(8, 12, 0b110_1100),
-        (Layout::Stereo, ..=224) => cpl(11, 12, 0b1100),
-        (Layout::Stereo, ..=256) => cpl(12, 12, 0b110),
-        (Layout::Stereo, _) => (None, 48),
-        (_, ..=256) => cpl(6, 5, 0),
-        (_, ..=320) => cpl(8, 8, 0b100),
-        (_, ..=384) => cpl(11, 10, 0),
-        (_, ..=512) => cpl(12, 12, 0b110),
+    if nfchans == 2 {
+        return match kbps {
+            0..=128 => cpl(1, 6, 0b1000_0000),
+            129..=160 => cpl(7, 8, 0b1010),
+            161..=192 => cpl(8, 12, 0b110_1100),
+            193..=224 => cpl(11, 12, 0b1100),
+            225..=256 => cpl(12, 12, 0b110),
+            _ => (None, 48),
+        };
+    }
+    match kbps * 5 / nfchans.max(1) as u32 {
+        0..=256 => cpl(6, 5, 0),
+        257..=320 => cpl(8, 8, 0b100),
+        321..=384 => cpl(11, 10, 0),
+        385..=512 => cpl(12, 12, 0b110),
         _ => (None, 48),
+    }
+}
+
+/// What one core codes, fixed at construction.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Core {
+    /// 2 (2/0), 6 (2/2, 7.1's dependent substream) or 7 (3/2).
+    pub(crate) acmod: u8,
+    pub(crate) lfe: bool,
+    /// The core's own rate, which picks its coupling range.
+    pub(crate) kbps: u32,
+    pub(crate) frame_bytes: usize,
+    pub(crate) blocks: usize,
+    pub(crate) syntax: Syntax,
+}
+
+impl Core {
+    /// AC-3 2.0 or 5.1 at `kbps`, a rate of Table 5.18.
+    pub(crate) fn ac3(layout: Layout, kbps: u32) -> Core {
+        let (acmod, lfe) = match layout {
+            Layout::Stereo => (2, false),
+            _ => (7, true),
+        };
+        Core {
+            acmod,
+            lfe,
+            kbps,
+            frame_bytes: 4 * kbps as usize,
+            blocks: 6,
+            syntax: Syntax::ac3(kbps),
+        }
     }
 }
 
@@ -160,6 +195,8 @@ pub(crate) struct Ac3 {
     remat: [bool; 4],
     /// Where the last frame's shared offset search ended, where the next one starts.
     hint: u32,
+    /// Blocks from the start of the six-block group to this frame's first.
+    group: usize,
     transients: transient::Detector,
     /// Bits through block 1 of the last frame, which crc1 must cover.
     #[cfg(test)]
@@ -173,29 +210,25 @@ pub(crate) struct Ac3 {
 }
 
 impl Ac3 {
-    pub(crate) fn new(layout: Layout, kbps: u32) -> Ac3 {
-        let blocks = 6;
-        let (acmod, nfchans, lfe) = match layout {
-            Layout::Stereo => (2, 2, false),
-            _ => (7, 5, true),
+    pub(crate) fn new(core: Core) -> Ac3 {
+        let Core { acmod, lfe, .. } = core;
+        let blocks = core.blocks.clamp(1, 6);
+        let nfchans = match acmod {
+            2 => 2,
+            6 => 4,
+            _ => 5,
         };
         let nch = nfchans + usize::from(lfe);
-        let rate = BITRATES.iter().position(|r| *r == kbps).unwrap_or(0);
-        let frame_bytes = 4 * BITRATES[rate] as usize;
-        let words = frame_bytes / 2;
-        let crc1_end = 2 * ((words >> 1) + (words >> 3));
-        let (cpl, chbwcod) = coupling_plan(layout, kbps);
+        let (cpl, chbwcod) = coupling_plan(nfchans, core.kbps);
         let stream = Stream {
+            syntax: core.syntax,
             blocks,
             acmod,
             lfe,
             nfchans,
-            frmsizecod: 2 * rate as u8,
             chbwcod,
             cpl,
-            frame_bytes,
-            crc1_end,
-            crc1_back: crc_shift_back(8 * (crc1_end - 2)),
+            frame_bytes: core.frame_bytes,
         };
         let range = |c: usize| match cpl {
             Some(b) if c == nch => (b.start(), b.end()),
@@ -225,6 +258,7 @@ impl Ac3 {
             coupling: cpl.map(|b| Box::new(coupling::Frame::new(b))),
             remat: [false; 4],
             hint: 0,
+            group: 0,
             transients: transient::Detector::default(),
             #[cfg(test)]
             first_bits: 0,
@@ -252,10 +286,11 @@ impl Ac3 {
 
     /// Keeps the 256 samples the next frame's first window shares with this one.
     pub(crate) fn advance(&mut self) {
-        let last = self.stream.blocks * BLOCK_SAMPLES;
+        let n = self.stream.blocks;
         for p in self.pcm.iter_mut() {
-            p.copy_within(last..last + BLOCK_SAMPLES, 0);
+            p.copy_within(n * BLOCK_SAMPLES..(n + 1) * BLOCK_SAMPLES, 0);
         }
+        self.group = (self.group + n) % 6;
     }
 
     /// Encodes the frame in `pcm` into `out`, `frame_bytes` long. A frame the tuner's
@@ -266,7 +301,8 @@ impl Ac3 {
         let Ok(budget) = self.size(out) else {
             return;
         };
-        let tuned = tuner::tune(&self.alloc, &budget, &mut self.hint);
+        let shared = self.stream.eac3();
+        let tuned = tuner::tune(&self.alloc, &budget, &mut self.hint, shared);
         let written = tuned.map(|off| self.write(out, &budget, &off));
         if !matches!(written, Some(Ok(()))) {
             let _ = self.write(out, &budget, &Offsets::default());
@@ -324,6 +360,16 @@ impl Ac3 {
         }
     }
 
+    /// syncinfo, BSI and, on E-AC-3, audfrm with the offsets.
+    fn header(&self, w: &mut BitWriter, off: &Offsets) -> Result<(), Overflow> {
+        let s = &self.stream;
+        let group = self.group == 0;
+        match s.syntax {
+            Syntax::Ac3 { frmsizecod, .. } => pack::header(w, s, frmsizecod),
+            Syntax::Eac3 { chanmap } => eac3::header(w, s, chanmap, &self.side, group, off),
+        }
+    }
+
     /// Where the mantissas must fit. Side information does not depend on the offsets'
     /// values: a dry run into `out` sizes it.
     fn size(&self, out: &mut [u8]) -> Result<Budget, Overflow> {
@@ -337,10 +383,10 @@ impl Ac3 {
             side: [0; 6],
             trailer: 18,
             frame: 8 * s.frame_bytes as u32,
-            first: 8 * s.crc1_end as u32,
+            first: s.five_eighths(),
         };
         let mut w = BitWriter::new(out);
-        pack::header(&mut w, s)?;
+        self.header(&mut w, &Offsets::default())?;
         budget.header = w.position() as u32;
         for b in 0..s.blocks {
             let at = w.position();
@@ -360,14 +406,17 @@ impl Ac3 {
         };
         tuner::fill(&mut self.alloc, off);
         let mant = tuner::mantissa_bits(&self.alloc, off);
-        let last_start =
-            budget.header + (0..5).map(|b| budget.side[b] + mant[b]).sum::<u32>() + budget.side[5];
-        let skips = pack::skips(budget.first.saturating_sub(last_start));
+        let skips = budget.first.map_or([None; 6], |first| {
+            let last_start = budget.header
+                + (0..5).map(|b| budget.side[b] + mant[b]).sum::<u32>()
+                + budget.side[5];
+            pack::skips(first.saturating_sub(last_start))
+        });
 
         let (order, n) = s.order();
         let order = &order[..n.min(MAX_SLOTS)];
         let mut w = BitWriter::new(out);
-        pack::header(&mut w, s)?;
+        self.header(&mut w, off)?;
         for (b, skip) in skips.into_iter().enumerate().take(s.blocks) {
             pack::block_side(&mut w, s, &self.side, choices, off, b, skip)?;
             #[cfg(test)]
@@ -401,20 +450,43 @@ mod tests {
     use oxideav_ac3::{audblk, bsi, decoder, syncinfo};
 
     impl Ac3 {
-        /// §5.5: blocks 0 and 1 end inside the first 5/8; block 5's mantissas start past it.
+        /// The tuned frame fits; on AC-3 (§5.5), blocks 0 and 1 end inside the first 5/8 and
+        /// block 5's mantissas start past it.
         fn assert_constraints(&self, what: &str) {
             assert_eq!(self.fallbacks, 0, "{what}: the tuned frame overflowed");
-            let five_eighths = 8 * self.stream.crc1_end;
-            assert!(self.first_bits <= five_eighths, "{what}: blocks 0-1");
-            assert!(self.last_start >= five_eighths, "{what}: block 5");
+            if let Some(five_eighths) = self.stream.five_eighths() {
+                let five_eighths = five_eighths as usize;
+                assert!(self.first_bits <= five_eighths, "{what}: blocks 0-1");
+                assert!(self.last_start >= five_eighths, "{what}: block 5");
+            }
         }
+    }
+
+    /// Every codec, layout and rate a core codes on its own.
+    fn configs() -> Vec<crate::Config> {
+        let codecs = [
+            crate::Blocks::One,
+            crate::Blocks::Two,
+            crate::Blocks::Three,
+            crate::Blocks::Six,
+        ]
+        .map(|blocks| crate::Codec::Eac3 { blocks });
+        let mut out = vec![];
+        for codec in [crate::Codec::Ac3].into_iter().chain(codecs) {
+            for layout in [Layout::Stereo, Layout::Surround51] {
+                for &kbps in crate::Config::bitrates(codec, layout) {
+                    out.extend(crate::Config::new(codec, layout, kbps));
+                }
+            }
+        }
+        out
     }
 
     /// Nearly equal L and R are coded as sum and difference in every band, and oxideav,
     /// undoing it, gets the input back.
     #[test]
     fn correlated_stereo_is_rematrixed() {
-        let mut enc = Ac3::new(Layout::Stereo, 192);
+        let mut enc = Ac3::new(Core::ac3(Layout::Stereo, 192));
         let mut state = audblk::Ac3State::new();
         let mut out = vec![0u8; enc.frame_bytes()];
         let mut pcm = vec![0f32; 1536 * 2];
@@ -452,33 +524,34 @@ mod tests {
         );
     }
 
-    /// The fallback frame, all offsets zero, fits every rate with the side information at
-    /// its largest: noise that jumps 60 dB from block to block in every channel, so every
+    /// The fallback frame, all offsets zero, fits every codec and rate with the side
+    /// information at its largest: noise that jumps 60 dB from block to block in every channel, so every
     /// block sends exponents and coordinates.
     #[test]
     fn silence_fits_every_rate() {
-        for layout in [Layout::Stereo, Layout::Surround51] {
-            for &kbps in crate::Config::bitrates(crate::Codec::Ac3, layout) {
-                let mut enc = Ac3::new(layout, kbps);
-                let mut out = vec![0u8; enc.frame_bytes()];
-                let mut seed = 3u32;
-                for (c, p) in enc.pcm_mut().iter_mut().enumerate() {
-                    for (i, v) in p.iter_mut().enumerate() {
-                        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                        let loud = (i / BLOCK_SAMPLES + c).is_multiple_of(2);
-                        let noise = (seed >> 9) as f32 / (1u32 << 22) as f32 - 1.0;
-                        *v = noise * if loud { 0.9 } else { 9e-4 };
-                    }
+        for config in configs() {
+            let mut enc = Ac3::new(config.core());
+            let mut out = vec![0u8; enc.frame_bytes()];
+            let mut seed = 3u32;
+            for (c, p) in enc.pcm_mut().iter_mut().enumerate() {
+                for (i, v) in p.iter_mut().enumerate() {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    let loud = (i / BLOCK_SAMPLES + c).is_multiple_of(2);
+                    let noise = (seed >> 9) as f32 / (1u32 << 22) as f32 - 1.0;
+                    *v = noise * if loud { 0.9 } else { 9e-4 };
                 }
-                enc.analyse();
-                let what = format!("{layout:?} {kbps}");
-                let budget = enc.size(&mut out).expect(&what);
-                assert!(tuner::tune(&enc.alloc, &budget, &mut 0).is_some(), "{what}");
-                enc.write(&mut out, &budget, &Offsets::default())
-                    .expect(&what);
-                enc.assert_constraints(&what);
-                assert!(decoder::verify_packet_crc(&out).unwrap().all_ok(), "{what}");
             }
+            enc.analyse();
+            let what = format!("{config:?}");
+            let budget = enc.size(&mut out).expect(&what);
+            assert!(
+                tuner::tune(&enc.alloc, &budget, &mut 0, false).is_some(),
+                "{what}"
+            );
+            enc.write(&mut out, &budget, &Offsets::default())
+                .expect(&what);
+            enc.assert_constraints(&what);
+            assert!(decoder::verify_packet_crc(&out).unwrap().all_ok(), "{what}");
         }
     }
 
@@ -489,7 +562,7 @@ mod tests {
         for layout in [Layout::Stereo, Layout::Surround51] {
             for &kbps in crate::Config::bitrates(crate::Codec::Ac3, layout) {
                 for level in [0.0, 1e-4] {
-                    let mut enc = Ac3::new(layout, kbps);
+                    let mut enc = Ac3::new(Core::ac3(layout, kbps));
                     let mut out = vec![0u8; enc.frame_bytes()];
                     for frame in 0..2 {
                         for p in enc.pcm_mut().iter_mut() {
@@ -513,7 +586,7 @@ mod tests {
     /// an eighth of it, within a step.
     #[test]
     fn coordinates_decode_to_the_band_energy_ratio() {
-        let mut enc = Ac3::new(Layout::Surround51, 320);
+        let mut enc = Ac3::new(Core::ac3(Layout::Surround51, 320));
         let mut state = audblk::Ac3State::new();
         let mut out = vec![0u8; enc.frame_bytes()];
         let mut pcm = vec![0f32; 1536 * 6];
@@ -569,7 +642,7 @@ mod tests {
             (Layout::Surround51, 448),
             (Layout::Surround51, 640),
         ] {
-            let mut enc = Ac3::new(layout, kbps);
+            let mut enc = Ac3::new(Core::ac3(layout, kbps));
             let mut state = audblk::Ac3State::new();
             let mut out = vec![0u8; enc.frame_bytes()];
             let mut pcm = vec![0f32; 1536 * enc.pcm.len()];

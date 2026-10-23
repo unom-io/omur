@@ -17,7 +17,8 @@
 //!
 //! Object audio (ETSI TS 103 420) is the [`joc`] module, behind the `joc` feature.
 //!
-//! Status: AC-3 2.0 and 5.1 with coupling and block switching; E-AC-3 is P2 (`docs/design.md`).
+//! Status: AC-3 and E-AC-3 (every frame length) 2.0 and 5.1, with coupling and block
+//! switching; E-AC-3 7.1 is P2 (`docs/design.md`).
 
 mod ac3;
 mod bitalloc;
@@ -151,6 +152,25 @@ impl Config {
         2 * words
     }
 
+    /// The core that codes the stream: AC-3, or E-AC-3's independent substream.
+    pub(crate) fn core(&self) -> ac3::Core {
+        let (acmod, lfe) = match self.layout {
+            Layout::Stereo => (2, false),
+            _ => (7, true),
+        };
+        match self.codec {
+            Codec::Ac3 => ac3::Core::ac3(self.layout, self.bitrate_kbps),
+            Codec::Eac3 { blocks } => ac3::Core {
+                acmod,
+                lfe,
+                kbps: self.bitrate_kbps,
+                frame_bytes: self.frame_bytes(),
+                blocks: blocks.count(),
+                syntax: pack::Syntax::Eac3 { chanmap: None },
+            },
+        }
+    }
+
     /// Samples from a sample entering `push` to the frame holding it leaving `pull`: the
     /// frame plus the 256 the last block's window reaches past it. The receiver's
     /// overlap-add adds another 256 on its side.
@@ -220,12 +240,12 @@ pub struct Encoder {
 }
 
 impl Encoder {
-    /// Panics on [`Codec::Eac3`]: E-AC-3 is P2 (docs/design.md §11).
+    /// Panics on 7.1, which is not built yet.
     pub fn new(config: Config) -> Result<Encoder, Error> {
-        if let Codec::Eac3 { .. } = config.codec {
-            todo!("P2, docs/design.md §11")
+        if config.layout == Layout::Surround71 {
+            todo!("7.1")
         }
-        let core = ac3::Ac3::new(config.layout, config.bitrate_kbps);
+        let core = ac3::Ac3::new(config.core());
         let bytes = core.frame_bytes();
         Ok(Encoder {
             config,

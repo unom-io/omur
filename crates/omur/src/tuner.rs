@@ -17,9 +17,9 @@ pub(crate) struct Budget {
     /// auxdatae, crcrsv and crc2.
     pub(crate) trailer: u32,
     pub(crate) frame: u32,
-    /// The first 5/8 of the frame, which must hold syncinfo, BSI and blocks 0 and 1, and
-    /// which block 5's mantissas must not start inside (§5.5).
-    pub(crate) first: u32,
+    /// The first 5/8 of an AC-3 frame, which must hold syncinfo, BSI and blocks 0 and 1,
+    /// and which block 5's mantissas must not start inside (§5.5). E-AC-3 has no such rule.
+    pub(crate) first: Option<u32>,
 }
 
 /// What skip fields can overshoot by: a byte's rounding plus one more field's 9 bits.
@@ -72,14 +72,16 @@ fn bits(t: &Tally) -> u32 {
     t.iter().map(|b| block_bits(*b)).sum()
 }
 
-/// The frame holds it, blocks 0 and 1 end inside the first 5/8, and block 5's mantissas
-/// with the trailer fit the last 3/8 once skip fields move them there.
+/// The frame holds it and, on AC-3, blocks 0 and 1 end inside the first 5/8, and block 5's
+/// mantissas with the trailer fit the last 3/8 once skip fields move them there.
 fn fits(t: &Tally, budget: &Budget) -> bool {
     let block: [u32; 6] = core::array::from_fn(|b| budget.side[b] + block_bits(t[b]));
     let total = budget.header + block.iter().sum::<u32>() + budget.trailer;
     total <= budget.frame
-        && budget.header + block[0] + block[1] <= budget.first
-        && block_bits(t[5]) + budget.trailer + SKIP_SLACK <= budget.frame - budget.first
+        && budget.first.is_none_or(|first| {
+            budget.header + block[0] + block[1] <= first
+                && block_bits(t[5]) + budget.trailer + SKIP_SLACK <= budget.frame - first
+        })
 }
 
 /// Offsets all zero mean every `bap` is zero (§7.2.2.1).
@@ -104,10 +106,15 @@ const GIVE: u8 = 4;
 
 /// The offsets the frame is coded with: the largest `16·csnroffst + fsnroffst` shared by
 /// every slot, searched outwards from `hint` (the last frame's, set to this one's) and then
-/// halved; then, from
-/// `GIVE` steps under it, one more fine step at a time for the slot whose step costs fewest
-/// bits, while the frame holds it. `None` if not even silence fits.
-pub(crate) fn tune(alloc: &[Alloc], budget: &Budget, hint: &mut u32) -> Option<Offsets> {
+/// halved; then, unless the fine offset is `shared`, from `GIVE` steps under it, one more
+/// fine step at a time for the slot whose step costs fewest bits, while the frame holds it.
+/// `None` if not even silence fits.
+pub(crate) fn tune(
+    alloc: &[Alloc],
+    budget: &Budget,
+    hint: &mut u32,
+    shared: bool,
+) -> Option<Offsets> {
     let slots = alloc.len().min(MAX_SLOTS);
     let at = |v: u32| Offsets {
         csnr: (v >> 4) as u8,
@@ -152,7 +159,7 @@ pub(crate) fn tune(alloc: &[Alloc], budget: &Budget, hint: &mut u32) -> Option<O
     }
     *hint = lo;
     let mut off = at(lo);
-    if lo == 0 {
+    if lo == 0 || shared {
         return Some(off);
     }
     let offset = |fine: u8| snr_offset(off.csnr, fine);
@@ -242,7 +249,7 @@ mod tests {
                 side: [900, 40, 200, 300, 250, 40],
                 trailer: 18,
                 frame,
-                first: frame * 5 / 8,
+                first: Some(frame * 5 / 8),
             })
     }
 
@@ -257,7 +264,7 @@ mod tests {
         ];
         for (budget, mut hint) in frames().zip([0, 1023, 300, 77, 512, 160, 9]) {
             let frame = budget.frame;
-            let off = tune(&alloc, &budget, &mut hint).expect("silence fits");
+            let off = tune(&alloc, &budget, &mut hint, false).expect("silence fits");
             assert!(
                 off.csnr <= 63 && off.fsnr.iter().all(|f| *f <= 15),
                 "{off:?}"

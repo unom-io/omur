@@ -2,6 +2,7 @@
 // usage: probe gen <out.s16> | enc <in.s16> <out.ac3> <kbps> | cmp <ref.s16> <dec.f32>
 //        | dump <stream.ac3> [summary]
 // `enc` and `cmp` read `CH` channels (6, or 2 for FL FR); `enc` feeds `CHUNK` samples a push.
+// omur's `enc` writes E-AC-3 with `BLOCKS` blocks a frame (1, 2, 3 or 6) when it is set.
 mod dump;
 
 use std::f32::consts::PI;
@@ -24,6 +25,20 @@ fn channels() -> usize {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(CH)
+}
+
+/// The codec omur's `enc` writes: E-AC-3 when `BLOCKS` is set, AC-3 otherwise.
+#[cfg(feature = "omur")]
+fn codec() -> omur::Codec {
+    let blocks = match std::env::var("BLOCKS").ok().as_deref() {
+        None => return omur::Codec::Ac3,
+        Some("1") => omur::Blocks::One,
+        Some("2") => omur::Blocks::Two,
+        Some("3") => omur::Blocks::Three,
+        Some("6") => omur::Blocks::Six,
+        Some(b) => panic!("BLOCKS={b}: 1, 2, 3 or 6"),
+    };
+    omur::Codec::Eac3 { blocks }
 }
 
 /// Samples per push: `CHUNK` from the environment, 5 ms by default.
@@ -96,7 +111,7 @@ fn enc(inp: &str, outp: &str, kbps: u64) {
     } else {
         omur::Layout::Surround51
     };
-    let config = omur::Config::new(omur::Codec::Ac3, layout, kbps as u32).unwrap();
+    let config = omur::Config::new(codec(), layout, kbps as u32).unwrap();
     let mut e = omur::Encoder::new(config).unwrap();
     // the tail: silence until the frame holding the last sample is out
     let mut input = pcm;
