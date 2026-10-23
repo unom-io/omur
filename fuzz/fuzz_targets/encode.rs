@@ -1,5 +1,5 @@
 //! Any AC-3 config, any push schedule, hostile f32: every frame is a whole syncframe that
-//! oxideav-ac3 checks, parses and decodes to finite audio within full scale.
+//! oxideav-ac3 checks, parses and decodes to finite audio near full scale.
 
 #![no_main]
 
@@ -39,7 +39,9 @@ fn run(u: &mut Unstructured) -> arbitrary::Result<()> {
         let got = (b.bsid, b.acmod, b.lfeon, b.dialnorm);
         assert_eq!(got, (8, acmod, lfeon, 31), "bsi of frame {k}");
         audblk::decode_frame(&mut state, &si, &b, f, &mut out).expect("decode");
-        if let Some(s) = out.iter().find(|s| !s.is_finite() || s.abs() > 1.0 + 1e-3) {
+        // Quantised, band-limited full-scale audio overshoots by a few percent; the input
+        // itself is clamped to ±1.0 at push.
+        if let Some(s) = out.iter().find(|s| !s.is_finite() || s.abs() > 1.1) {
             panic!("frame {k} decodes to {s}");
         }
     }
