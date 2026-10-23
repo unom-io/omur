@@ -214,7 +214,7 @@ pub(crate) fn block_side(
                 }
             }
             if s.acmod == 2 {
-                w.put(0, 1)?; // phsflginu
+                w.put(u32::from(f.phased), 1)?; // phsflginu
             }
             w.put(u32::from(f.bands.begf), 4)?;
             w.put(u32::from(f.bands.endf), 4)?;
@@ -236,6 +236,12 @@ pub(crate) fn block_side(
                     w.put(u32::from(*e), 4)?;
                     w.put(u32::from(*m), 4)?;
                 }
+            }
+        }
+        let sent = f.send[blk].iter().take(fbw.len()).any(|s| *s) || (e && first);
+        if s.acmod == 2 && f.phased && sent {
+            for flag in f.phase[blk].iter().take(n) {
+                w.put(u32::from(*flag), 1)?; // phsflg
             }
         }
     }

@@ -16,7 +16,7 @@ fn fnv1a(bytes: impl IntoIterator<Item = u8>) -> u64 {
 #[test]
 fn ac3_output_is_unchanged() {
     let cases = [
-        (Layout::Stereo, 192, 0xb657_9f4a_0ccc_becbu64),
+        (Layout::Stereo, 192, 0xe8a0_a309_13a0_ed44u64),
         (Layout::Surround51, 320, 0xa0d7_4b00_893d_b4a7),
         (Layout::Surround51, 448, 0x80f0_ece0_874b_147b),
         (Layout::Surround51, 640, 0xe576_49b9_ad67_41c9),
