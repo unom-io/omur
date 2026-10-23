@@ -320,7 +320,8 @@ mod tests {
     }
 
     /// Each channel's coupling coordinates, as oxideav decodes them, are the square root of
-    /// its band energy over the coupling channel's, an eighth of it, within a step.
+    /// its band energy over the coupling channel's, summed over the blocks they hold for,
+    /// an eighth of it, within a step.
     #[test]
     fn coordinates_decode_to_the_band_energy_ratio() {
         let mut enc = Ac3::new(Layout::Surround51, 320);
@@ -346,8 +347,13 @@ mod tests {
                 let blk = (0..6).rev().find(|b| f.send[*b][c]).unwrap();
                 let mut lo = f.bands.start();
                 for (k, hi) in edges.iter().take(f.bands.count()).enumerate() {
-                    let energy =
-                        |s: usize| -> f32 { enc.coef[s][blk][lo..*hi].iter().map(|v| v * v).sum() };
+                    let energy = |s: usize| -> f32 {
+                        enc.coef[s][blk..]
+                            .iter()
+                            .flat_map(|b| &b[lo..*hi])
+                            .map(|v| v * v)
+                            .sum()
+                    };
                     let want = (energy(c) / energy(cs)).sqrt() / 8.0;
                     let got = state.cpl_coord[c][k];
                     assert!(

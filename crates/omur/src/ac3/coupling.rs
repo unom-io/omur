@@ -1,7 +1,7 @@
 //! Channel coupling (§7.4, §8.2.4, §8.2.5): above the coupling start the full-bandwidth
 //! channels share one spectrum, their sum, and each keeps its envelope as one
 //! coordinate per band. A channel's coordinates go out in block 0 and again in any block
-//! where one of them moves by more than a quantiser step.
+//! where one of them moves by more than half an octave.
 
 /// Most coupling bands: the 18 sub-bands of Table 7.24, none merged.
 pub(crate) const MAX_BANDS: usize = 18;
@@ -144,13 +144,16 @@ const PEAK: f32 = 0.98;
 /// Forms the frame's coupling channel into `cpl`, the sum of `coef[..nf]` over the coupling
 /// range, and decides `frame`'s coordinates from each band's energy ratio. The sum, not
 /// the average, keeps the channel clear of the hearing threshold at the top of the band.
+/// A channel's coordinates hold from block to block while every band stays within
+/// `MOVE_STEPS` of the run's ratio, energies summed over the run.
 pub(crate) fn form(coef: &[[[f32; 256]; 6]], cpl: &mut [[f32; 256]; 6], frame: &mut Frame) {
     let bands = frame.bands;
     let (start, end) = (bands.start(), bands.end().min(256));
     let n = bands.count().min(MAX_BANDS);
     let edges = bands.edges();
     let nf = coef.len().min(MAX_FBW);
-    let mut sent = [[ZERO; MAX_BANDS]; MAX_FBW];
+    let mut energy = [[0f32; MAX_BANDS]; 6];
+    let mut own = [[[0f32; MAX_BANDS]; 6]; MAX_FBW];
     for b in 0..6 {
         let out = &mut cpl[b];
         out.fill(0.0);
@@ -167,33 +170,66 @@ pub(crate) fn form(coef: &[[[f32; 256]; 6]], cpl: &mut [[f32; 256]; 6], frame: &
             }
         }
         let mut lo = start;
-        let mut energy = [0f32; MAX_BANDS];
-        for (k, e) in energy.iter_mut().enumerate().take(n) {
-            *e = out[lo..edges[k]].iter().map(|v| v * v).sum();
+        for k in 0..n {
+            let band = lo..edges[k];
+            energy[b][k] = out[band.clone()].iter().map(|v| v * v).sum();
+            for (o, ch) in own.iter_mut().zip(coef) {
+                o[b][k] = ch[b][band.clone()].iter().map(|v| v * v).sum();
+            }
             lo = edges[k];
         }
-        for (c, ch) in coef.iter().take(nf).enumerate() {
-            let mut idx = [ZERO; MAX_BANDS];
-            let mut lo = start;
-            for k in 0..n {
-                let own: f32 = ch[b][lo..edges[k]].iter().map(|v| v * v).sum();
-                if energy[k] > 0.0 {
-                    idx[k] = index((own / energy[k]).sqrt() * 0.125);
-                }
-                lo = edges[k];
+    }
+    let ratio = |own: &[f32; MAX_BANDS], cpl: &[f32; MAX_BANDS]| -> [u16; MAX_BANDS] {
+        core::array::from_fn(|k| {
+            if k < n && cpl[k] > 0.0 {
+                index((own[k] / cpl[k]).sqrt() * 0.125).min(MOVE_FLOOR)
+            } else {
+                MOVE_FLOOR
             }
-            let moved = idx[..n]
-                .iter()
-                .zip(&sent[c][..n])
-                .any(|(a, s)| a.abs_diff(*s) > 1);
-            frame.send[b][c] = b == 0 || moved;
-            if frame.send[b][c] {
-                sent[c] = idx;
-                code(&idx[..n], &mut frame.coords[b][c]);
+        })
+    };
+    for (c, own) in own.iter().enumerate().take(nf) {
+        let mut first = 0;
+        let (mut acc_own, mut acc_cpl) = (own[0], energy[0]);
+        for b in 1..=6 {
+            let run = ratio(&acc_own, &acc_cpl);
+            let moved = b == 6 || {
+                let here = ratio(&own[b], &energy[b]);
+                here.iter()
+                    .zip(&run)
+                    .any(|(h, r)| h.abs_diff(*r) > MOVE_STEPS)
+            };
+            frame.send[b.min(5)][c] = false;
+            if !moved {
+                for k in 0..n {
+                    acc_own[k] += own[b][k];
+                    acc_cpl[k] += energy[b][k];
+                }
+                continue;
+            }
+            let mut idx = [ZERO; MAX_BANDS];
+            for k in 0..n {
+                if acc_cpl[k] > 0.0 {
+                    idx[k] = index((acc_own[k] / acc_cpl[k]).sqrt() * 0.125);
+                }
+            }
+            frame.send[first][c] = true;
+            code(&idx[..n], &mut frame.coords[first][c]);
+            if b < 6 {
+                (first, acc_own, acc_cpl) = (b, own[b], energy[b]);
             }
         }
     }
 }
+
+/// Coordinates at or under this index (`2^-4`: the channel 6 to 12 dB under the coupling
+/// channel) count as one when deciding whether a coordinate moved.
+const MOVE_FLOOR: u16 = 64;
+
+/// Grid steps a band may move before the channel resends: 8, half an octave, 3 dB. One
+/// step resends in nearly every block, and those bits cost FL 0.5 dB at 320 kbit/s with
+/// nothing gained on the burst channels.
+const MOVE_STEPS: u16 = 8;
 
 #[cfg(test)]
 mod tests {
