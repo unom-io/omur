@@ -60,6 +60,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "omur-gen-tables"
+version = "0.1.0"
+
+[[package]]
 name = "omur-probe"
 version = "0.1.0"
 dependencies = [

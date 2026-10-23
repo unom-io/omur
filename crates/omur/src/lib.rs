@@ -19,6 +19,8 @@
 //!
 //! Status: design, in `docs/design.md`. Nothing encodes yet.
 
+#![allow(dead_code)]
+
 mod ac3;
 mod bitalloc;
 mod bits;
@@ -30,6 +32,7 @@ mod mantissas;
 mod mdct;
 mod pack;
 mod tables;
+mod tables_gen;
 mod tuner;
 
 use core::fmt;

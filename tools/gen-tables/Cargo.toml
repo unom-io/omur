@@ -1,0 +1,16 @@
+# Prints crates/omur/src/tables_gen.rs: the transform's window and twiddles, computed once in
+# f64 and committed, so the encoder evaluates no transcendental (docs/design.md D4).
+[package]
+name = "omur-gen-tables"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "gen-tables"
+path = "src/main.rs"
+
+[lints]
+workspace = true
