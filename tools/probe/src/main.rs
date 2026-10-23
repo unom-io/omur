@@ -1,11 +1,14 @@
 // AC-3 encoder probe: omur or a reference Rust encoder vs ffmpeg's ac3, decoded by ffmpeg.
 // usage: probe gen <out.s16> | enc <in.s16> <out.ac3> <kbps> | cmp <ref.s16> <dec.f32>
-//        | dump <stream.ac3> [summary] | fold <in8.s16> <out6.s16>
+//        | dump <stream.ac3> [summary] | fold <in8.s16> <out6.s16> | scene <dir> [kbps] [s]
 // `gen`, `enc` and `cmp` take `CH` channels (6; 2 for FL FR; 8 for 7.1); `enc` feeds `CHUNK`
 // samples a push. omur's `enc` writes E-AC-3 with `BLOCKS` blocks a frame (1, 2, 3 or 6)
 // when it is set, and always for 7.1; `SUBSTREAM=0` keeps only the independent syncframes.
-// `fold` writes the 5.1 a receiver plays from 7.1's independent substream alone.
+// `fold` writes the 5.1 a receiver plays from 7.1's independent substream alone. `scene`
+// (feature `joc`) writes and encodes the object-audio scenes (scene.rs).
 mod dump;
+#[cfg(feature = "joc")]
+mod scene;
 
 use std::f32::consts::PI;
 use std::time::Instant;
@@ -350,6 +353,12 @@ fn main() {
         "cmp" => cmp(&a[2], &a[3]),
         "dump" => dump::dump(&a[2], a.get(3).is_some_and(|s| s == "summary")),
         "fold" => fold(&a[2], &a[3]),
-        _ => panic!("gen | enc | cmp | dump | fold"),
+        #[cfg(feature = "joc")]
+        "scene" => scene::scene(
+            &a[2],
+            a.get(3).map_or(768, |k| k.parse().unwrap()),
+            a.get(4).map_or(10.0, |s| s.parse().unwrap()),
+        ),
+        _ => panic!("gen | enc | cmp | dump | fold | scene (feature joc)"),
     }
 }

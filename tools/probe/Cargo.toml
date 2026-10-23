@@ -23,6 +23,8 @@ default = ["oxideav"]
 oxideav = []
 vuio = ["dep:vuio-codec-ac3", "dep:vuio-codec-core"]
 omur = ["dep:omur"]
+# `scene`: object audio (TS 103 420) through omur's `joc` module.
+joc = ["omur", "omur/joc"]
 
 [dependencies]
 omur = { workspace = true, optional = true }
