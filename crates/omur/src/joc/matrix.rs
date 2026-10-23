@@ -11,16 +11,16 @@
 //! What a frame sends per element, cheapest first: `Reuse` (the decoder holds last frame's
 //! matrix); one smooth data point (the matrix ramps there over the frame); two steep ones
 //! (the old matrix for timeslot 0, the first to timeslot `b`, the second after) when the
-//! element moved or a transient landed mid-frame. Sparse mode keeps one core channel and
-//! gives the others +0.4, Pseudocode 2's offset of 50 over the centre 48; it is written for
-//! one band, where its channel index reads one way, and taken where it saves bits for no
-//! more error.
+//! element moved or a transient landed mid-frame. Sparse mode keeps one core channel per
+//! band and gives the others +0.4, Pseudocode 2's offset of 50 over the centre 48; it is
+//! taken where it saves bits for no more error. Its channel index reads as Pseudocode 2
+//! reads it: band `pb`'s channel is the sum of the indices sent for `pb − 1` and `pb`.
 
 use super::MAX_ELEMENTS;
 use super::qmf::SUBBANDS;
 use super::tables::{
     ATOM_BAND, ATOM_START, COARSE_MTX_CODE, COARSE_MTX_LEN, COARSE_VEC_CODE, COARSE_VEC_LEN,
-    FINE_MTX_CODE, FINE_MTX_LEN, FINE_VEC_CODE, FINE_VEC_LEN, NUM_BANDS,
+    FINE_MTX_CODE, FINE_MTX_LEN, FINE_VEC_CODE, FINE_VEC_LEN, NUM_BANDS, POS_CODE, POS_LEN,
 };
 use crate::bits::{BitWriter, Overflow};
 
@@ -71,16 +71,6 @@ struct Quad {
 }
 
 impl Quad {
-    fn add(&mut self, o: &Quad) {
-        self.a += o.a;
-        for (x, y) in self.lin.iter_mut().zip(o.lin) {
-            *x += y;
-        }
-        for (x, y) in self.q.iter_mut().zip(o.q) {
-            *x += y;
-        }
-    }
-
     fn sub(&mut self, o: &Quad) {
         self.a -= o.a;
         for (x, y) in self.lin.iter_mut().zip(o.lin) {
@@ -259,10 +249,8 @@ impl Quant {
         }
     }
 
-    /// `joc_vec` code word of a sparse band's value index, counted from the sparse offset
-    /// of Pseudocode 2 (50 or 100 steps, two or four above the centre).
-    fn vec(self, v: i16) -> (u32, u8) {
-        let s = i32::from(v) - self.sparse();
+    /// `joc_vec` code word of a difference of a sparse band's value indices (Pseudocode 2).
+    fn vec(self, s: i32) -> (u32, u8) {
         if self.fine {
             let s = s.rem_euclid(192) as usize;
             (FINE_VEC_CODE[s], FINE_VEC_LEN[s])
@@ -298,8 +286,8 @@ struct Coded {
     quant: Quant,
     /// `joc_num_bands_idx`.
     bands: u8,
-    /// The channel a sparse frame keeps.
-    sparse: Option<u8>,
+    /// Sparse, the channel each data point keeps per band.
+    sparse: Option<[[u8; SPLIT]; 2]>,
     /// Value indices by data point, channel and band.
     v: [[[i16; SPLIT]; CH]; 2],
     bits: u32,
@@ -307,6 +295,31 @@ struct Coded {
 }
 
 impl Coded {
+    /// Data point `dp` of a sparse frame keeping `keep` as its code words (clause 6.2.5): the
+    /// first band's channel in three bits, each later band's channel index, then each band's
+    /// value from the one its channel held a band before, or from the sparse offset.
+    fn sparse_words(&self, keep: &[u8; SPLIT], dp: usize) -> impl Iterator<Item = (u32, u8)> {
+        let nb = usize::from(NUM_BANDS[usize::from(self.bands)]);
+        let channels = keep[..nb].windows(2).scan(keep[0], |sent, pair| {
+            let i = usize::from((pair[1] + CH as u8 - *sent) % CH as u8);
+            *sent = i as u8;
+            Some((POS_CODE[i], POS_LEN[i]))
+        });
+        let (quant, v) = (self.quant, self.v[dp]);
+        let keep = *keep;
+        let values = (0..nb).map(move |b| {
+            let ch = usize::from(keep[b]) % CH;
+            let from = match b {
+                0 => quant.sparse(),
+                _ => i32::from(v[ch][b - 1]),
+            };
+            quant.vec(i32::from(v[ch][b]) - from)
+        });
+        std::iter::once((u32::from(keep[0]), 3))
+            .chain(channels)
+            .chain(values)
+    }
+
     fn reuse(err: f32) -> Coded {
         Coded {
             mode: Mode::Reuse,
@@ -688,50 +701,6 @@ impl Joc {
                 c.err += e;
             }
         }
-        // one band and one channel carrying it: sparse, if no worse for fewer bits
-        if nb == 1 {
-            let mut sparse = c;
-            sparse.bits = c.bits - (0..points).map(|dp| self.dense_bits(&c, dp)).sum::<u32>();
-            sparse.err = pre;
-            let mut whole = [Quad::default(); 2];
-            for (w, quads) in whole.iter_mut().zip(fit).take(points) {
-                for g in quads.iter() {
-                    w.add(g);
-                }
-            }
-            let mut best: Option<(u8, [i16; 2], f32)> = None;
-            for keep in 0..CH {
-                let (mut err, mut vs) = (0f32, [0i16; 2]);
-                for (dp, q) in whole.iter().enumerate().take(points) {
-                    let other = quant.value(quant.sparse() as i16);
-                    let mut m = [other; CH];
-                    let mut lin = q.lin[keep];
-                    for d in (0..CH).filter(|d| *d != keep) {
-                        lin += 2.0 * q.q[pair(keep, d)] * other;
-                    }
-                    let qq = q.q[pair(keep, keep)];
-                    let opt = if qq > 0.0 { -lin / (2.0 * qq) } else { 0.0 };
-                    vs[dp] = quant.index(opt);
-                    m[keep] = quant.value(vs[dp]);
-                    err += q.eval(&m);
-                }
-                if best.is_none_or(|b| err < b.2) {
-                    best = Some((keep as u8, vs, err));
-                }
-            }
-            if let Some((keep, vs, err)) = best {
-                sparse.sparse = Some(keep);
-                sparse.err += err;
-                for (dp, v) in vs.iter().enumerate().take(points) {
-                    sparse.v[dp] = [[quant.sparse() as i16; SPLIT]; CH];
-                    sparse.v[dp][usize::from(keep)][0] = *v;
-                    sparse.bits += 3 + u32::from(quant.vec(*v).1);
-                }
-                if sparse.err <= c.err && sparse.bits < c.bits {
-                    c = sparse;
-                }
-            }
-        }
         if mode == Mode::Smooth && self.expand(&c, 0) == self.prev[k] {
             return Coded::reuse(c.err);
         }
@@ -752,15 +721,69 @@ impl Joc {
         bits
     }
 
+    /// Element `k`'s coded frame `c` sparse: each band on the one core channel that carries
+    /// it, the others at Pseudocode 2's offset; kept where it saves bits for no more error.
+    fn sparse(&self, k: usize, c: &Coded) -> Option<Coded> {
+        let f = &self.fits[k];
+        let (fit, pre) = match c.mode {
+            Mode::Reuse => return None,
+            Mode::Smooth => ([&f.smooth; 2], 0.0),
+            Mode::Jump => ([&f.jump; 2], f.pre),
+            Mode::Steep(_) => ([&f.first, &f.second], f.pre),
+        };
+        let (quant, points) = (c.quant, c.points());
+        let nb = usize::from(NUM_BANDS[usize::from(c.bands)]);
+        let other = quant.value(quant.sparse() as i16);
+        let mut sparse = *c;
+        sparse.bits = c.bits - (0..points).map(|dp| self.dense_bits(c, dp)).sum::<u32>();
+        sparse.err = pre;
+        let mut keep = [[0u8; SPLIT]; 2];
+        for (dp, (quads, keep)) in fit.iter().zip(keep.iter_mut()).enumerate().take(points) {
+            let mut band = Sums::default();
+            for (g, q) in quads.iter().enumerate() {
+                band.add(atom_band(c.bands, g), q);
+            }
+            // with every channel at `other`, then one moved by δ: E + δ·g + δ²·q_kk
+            let at = band.eval(&[[other; SPLIT]; CH], nb);
+            let mut best = [(f32::MAX, 0i16); SPLIT];
+            for ch in 0..CH {
+                let mut g = band.lin[ch];
+                for d in 0..CH {
+                    for (g, q) in g.iter_mut().zip(&band.q[pair(ch, d)]) {
+                        *g += 2.0 * other * q;
+                    }
+                }
+                let (qq, mut v, mut err) = (&band.q[pair(ch, ch)], [0i16; SPLIT], [0f32; SPLIT]);
+                for ((((v, e), g), q), at) in v.iter_mut().zip(&mut err).zip(g).zip(qq).zip(at) {
+                    let opt = if *q > 0.0 { other - g / (2.0 * q) } else { 0.0 };
+                    *v = quant.index(opt);
+                    let delta = quant.value(*v) - other;
+                    *e = (at + delta * g + delta * delta * q).max(0.0);
+                }
+                let picks = best.iter_mut().zip(keep.iter_mut()).zip(err).zip(v);
+                for (((best, keep), err), v) in picks.take(nb) {
+                    if err < best.0 {
+                        (*best, *keep) = ((err, v), ch as u8);
+                    }
+                }
+            }
+            sparse.v[dp] = [[quant.sparse() as i16; SPLIT]; CH];
+            for (b, ((err, v), ch)) in best.iter().zip(keep.iter()).enumerate().take(nb) {
+                sparse.v[dp][usize::from(*ch)][b] = *v;
+                sparse.err += err;
+            }
+            let words = sparse.sparse_words(keep, dp).map(|(_, len)| u32::from(len));
+            sparse.bits += words.sum::<u32>();
+        }
+        sparse.sparse = Some(keep);
+        (sparse.err <= c.err && sparse.bits < c.bits).then_some(sparse)
+    }
+
     /// Data point `dp` of `c` as the decoder holds it per split band.
     fn expand(&self, c: &Coded, dp: usize) -> [[f32; CH]; SPLIT] {
         let mut out = [[0f32; CH]; SPLIT];
         for (g, o) in out.iter_mut().enumerate() {
-            let b = if c.sparse.is_some() {
-                0
-            } else {
-                atom_band(c.bands, g)
-            };
+            let b = atom_band(c.bands, g);
             for (o, v) in o.iter_mut().zip(&c.v[dp]) {
                 *o = c.quant.value(v[b]);
             }
@@ -888,6 +911,11 @@ impl Joc {
                 *c = Coded::reuse(0.0);
             }
         }
+        for k in 0..n {
+            if let Some(sparse) = self.sparse(k, &self.coded[k]) {
+                self.coded[k] = sparse;
+            }
+        }
         self.reset();
         self.write(out)
     }
@@ -923,10 +951,10 @@ impl Joc {
         for c in self.coded.iter() {
             let nb = usize::from(NUM_BANDS[usize::from(c.bands)]);
             for dp in 0..c.points() {
-                if let Some(keep) = c.sparse {
-                    w.put(u32::from(keep), 3)?;
-                    let (code, len) = c.quant.vec(c.v[dp][usize::from(keep)][0]);
-                    w.put(code, u32::from(len))?;
+                if let Some(keep) = &c.sparse {
+                    for (code, len) in c.sparse_words(&keep[dp], dp) {
+                        w.put(code, u32::from(len))?;
+                    }
                     continue;
                 }
                 for ch in 0..CH {
@@ -960,6 +988,42 @@ impl Joc {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::joc::{emdf, gate};
+    use oxideav_ac3::eac3::joc::{parse_ec3_extension_type_a, parse_joc_emdf};
+
+    #[test]
+    fn a_sparse_frame_reads_back_as_pseudocode_2_decodes_it() {
+        // five bands on C C C Rs L: indices 2 0 2 2 3, which a running sum would misread
+        let (quant, keep) = (Quant { fine: false }, [2u8, 2, 2, 4, 0]);
+        let mut c = Coded::reuse(0.0);
+        (c.mode, c.quant, c.bands) = (Mode::Smooth, quant, 2);
+        c.v[0] = [[quant.sparse() as i16; SPLIT]; CH];
+        for (b, (k, v)) in keep.iter().zip([5, -3, 7, -10, 1]).enumerate() {
+            c.v[0][usize::from(*k)][b] = v;
+        }
+        let mut sparse = [[0; SPLIT]; 2];
+        sparse[0][..5].copy_from_slice(&keep);
+        c.sparse = Some(sparse);
+        let mut joc = Joc::new(1);
+        joc.coded[0] = c;
+        let mut payload = [0u8; 64];
+        let n = joc.write(&mut payload).unwrap();
+        let mut field = [0u8; emdf::MAX];
+        let m = emdf::write(&mut field, &[0x12, 0x34], &payload[..n]).unwrap();
+        let signal = parse_ec3_extension_type_a(&emdf::addbsi(1))
+            .unwrap()
+            .unwrap();
+        let dbg = format!("{:?}", parse_joc_emdf(&field[..m], signal).unwrap());
+        let got = gate::numbers(&dbg, "coefficients");
+        let want: Vec<f64> = (0..CH)
+            .flat_map(|ch| (0..5).map(move |b| f64::from(quant.value(c.v[0][ch][b]))))
+            .collect();
+        assert_eq!(got.len(), want.len(), "{dbg}");
+        assert!(
+            got.iter().zip(&want).all(|(g, w)| (g - w).abs() < 1e-6),
+            "{got:?}"
+        );
+    }
 
     #[test]
     fn pairs_index_the_upper_triangle() {

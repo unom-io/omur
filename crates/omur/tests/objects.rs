@@ -500,7 +500,7 @@ fn object_output_is_unchanged() {
         ("mix", pinned_mix(12 * FRAME), 0x0f28_181f_1af8_7abfu64),
         ("crowd", pinned_crowd(8 * FRAME), 0x1548_9232_7be0_22c6),
         ("jumps", pinned_jumps(8 * FRAME), 0xf3c8_94b5_b2aa_fefd),
-        ("bands", pinned_bands(12 * FRAME), 0x3f7d_f296_f481_c27d),
+        ("bands", pinned_bands(12 * FRAME), 0x658c_be57_da4d_944b),
     ];
     for (name, s, want) in cases {
         let got = fnv1a(encode(&s, 768, 240).concat());

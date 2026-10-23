@@ -5,7 +5,7 @@
 use std::f64::consts::PI;
 use std::fmt::Write;
 
-use crate::joc_data::{COARSE_MTX, COARSE_VEC, FINE_MTX, FINE_VEC, QWIN};
+use crate::joc_data::{COARSE_MTX, COARSE_VEC, FINE_MTX, FINE_VEC, POS_5CH, QWIN};
 use crate::{table, twiddles};
 
 /// Table 54 by row: the first QMF subband of the row, then its parameter band for 23, 15,
@@ -189,6 +189,12 @@ pub(crate) fn generate() -> String {
         "Table A.4, sparse, 192 steps",
         "FINE_VEC",
         FINE_VEC,
+    );
+    huffman(
+        &mut out,
+        "Table A.5, a sparse band's channel index, five channels",
+        "POS",
+        POS_5CH,
     );
     out
 }

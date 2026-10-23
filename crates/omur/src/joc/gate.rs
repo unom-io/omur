@@ -232,7 +232,7 @@ pub(super) fn encode(scene: &Scene, kbps: u32, chunk: usize) -> (Vec<Vec<u8>>, O
 type Update = Option<(usize, bool, Vec<usize>, Vec<f32>)>;
 
 /// A list of numbers after `key: [` in `s`.
-fn numbers(s: &str, key: &str) -> Vec<f64> {
+pub(super) fn numbers(s: &str, key: &str) -> Vec<f64> {
     let Some(at) = s.find(&format!("{key}: [")) else {
         return vec![];
     };
