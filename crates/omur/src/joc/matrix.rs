@@ -16,6 +16,7 @@
 //! one band, where its channel index reads one way, and taken where it saves bits for no
 //! more error.
 
+use super::MAX_ELEMENTS;
 use super::qmf::SUBBANDS;
 use super::tables::{
     ATOM_BAND, ATOM_START, COARSE_MTX_CODE, COARSE_MTX_LEN, COARSE_VEC_CODE, COARSE_VEC_LEN,
@@ -345,14 +346,15 @@ fn group(v: &Bands) -> [f32; SPLIT] {
 }
 
 /// One element's running sums: `Re Σ z·conj(x_c)` plain and weighted by `w`, `Σ |z|²`,
-/// timeslot 0 apart, its energy per timeslot, and the plain sums of it and of the core
-/// before `split`, the timeslot a steep second data point starts.
+/// timeslot 0 apart, the sum and the peak of its energy per timeslot, and the plain sums of
+/// it and of the core before `split`, the timeslot a steep second data point starts.
 struct Element {
     c: [[Bands; CH]; 2],
     c0: [Bands; CH],
     e: Bands,
     e0: Bands,
-    level: [f32; SLOTS],
+    before: f32,
+    peak: f32,
     split: Option<u8>,
     sx: [Bands; 15],
     sc: [Bands; CH],
@@ -406,7 +408,8 @@ impl Joc {
             c0: [[0.0; SUBBANDS]; CH],
             e: [0.0; SUBBANDS],
             e0: [0.0; SUBBANDS],
-            level: [0.0; SLOTS],
+            before: 0.0,
+            peak: 0.0,
             split: None,
             sx: [[0.0; SUBBANDS]; 15],
             sc: [[0.0; SUBBANDS]; CH],
@@ -454,18 +457,31 @@ impl Joc {
         events: &[Option<u8>],
     ) {
         let w = (t + 1) as f32 / SLOTS as f32;
-        for (k, (zk, s)) in z.iter().zip(self.sums.iter_mut()).enumerate() {
-            if quiet.get(k).copied().unwrap_or(true) {
-                continue;
-            }
-            let mut e = [0f32; SUBBANDS];
+        // every element's energy per subband, then its sum over them element by element
+        // within each subband, so the sums' chains of additions run side by side
+        let mut energy = [[0f32; SUBBANDS]; MAX_ELEMENTS];
+        for (e, zk) in energy.iter_mut().zip(z) {
             for (sb, v) in e.iter_mut().enumerate() {
                 *v = zk[0][sb] * zk[0][sb] + zk[1][sb] * zk[1][sb];
             }
-            let level: f32 = e.iter().sum();
-            let before: f32 = s.level[..t].iter().sum();
-            let top = s.level[..t].iter().cloned().fold(level, f32::max);
-            let transient = t >= 2 && level > 8.0 * before / t as f32 && level > 1e-3 * top;
+        }
+        let mut levels = [-0.0f32; MAX_ELEMENTS];
+        for sb in 0..SUBBANDS {
+            for (l, e) in levels.iter_mut().zip(&energy) {
+                *l += e[sb];
+            }
+        }
+        for (k, ((zk, s), (e, level))) in z
+            .iter()
+            .zip(self.sums.iter_mut())
+            .zip(energy.iter().zip(levels))
+            .enumerate()
+        {
+            if quiet.get(k).copied().unwrap_or(true) {
+                continue;
+            }
+            let top = s.peak.max(level);
+            let transient = t >= 2 && level > 8.0 * s.before / t as f32 && level > 1e-3 * top;
             let event = events.get(k).copied().flatten() == Some(t as u8);
             if s.split.is_none() && t >= 2 && (transient || event) {
                 s.split = Some(t as u8);
@@ -473,7 +489,7 @@ impl Joc {
                 s.sc = s.c[0];
                 s.se = s.e;
             }
-            s.level[t] = level;
+            (s.before, s.peak) = (s.before + level, top);
             for (a, v) in s.e.iter_mut().zip(e) {
                 *a += v;
             }
@@ -523,7 +539,7 @@ impl Joc {
             s.c = [[[0.0; SUBBANDS]; CH]; 2];
             s.c0 = [[0.0; SUBBANDS]; CH];
             (s.e, s.e0) = ([0.0; SUBBANDS], [0.0; SUBBANDS]);
-            s.level = [0.0; SLOTS];
+            (s.before, s.peak) = (0.0, 0.0);
             s.split = None;
         }
     }
