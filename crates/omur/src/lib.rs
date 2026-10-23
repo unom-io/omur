@@ -319,7 +319,6 @@ impl Encoder {
     /// An E-AC-3 encoder whose independent substream's `addbsi` signals object audio with
     /// `objects` objects (TS 103 420 clause 8.3).
     #[cfg(feature = "joc")]
-    #[allow(dead_code)]
     pub(crate) fn objects(config: Config, objects: u8) -> Encoder {
         let (mut core, dep) = config.cores();
         if let pack::Syntax::Eac3 { objects: o, .. } = &mut core.syntax {

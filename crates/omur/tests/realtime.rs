@@ -1,6 +1,6 @@
-//! Nothing allocates after `Encoder::new` (docs/design.md D3): a counting global allocator
-//! around 100 push/pull cycles per stream. A binary of its own without the test harness, so
-//! no other thread allocates meanwhile.
+//! Nothing allocates after `Encoder::new` or `ObjectEncoder::new` (docs/design.md D3): a
+//! counting global allocator around 100 push/pull cycles per stream. A binary of its own
+//! without the test harness, so no other thread allocates meanwhile.
 
 use std::alloc::System;
 use std::hint::black_box;
@@ -55,5 +55,57 @@ fn main() {
         );
         total += frames;
     }
-    println!("realtime: 400 push/pull cycles, {total} frames, no allocation");
+    #[cfg(feature = "joc")]
+    {
+        total += objects();
+    }
+    println!("realtime: push/pull cycles, {total} frames, no allocation");
+}
+
+/// A 7.1.4 bed and 32 objects, folding into the 16 elements, every object moving.
+#[cfg(feature = "joc")]
+fn objects() -> usize {
+    use omur::joc::{Bed, BedChannel, ObjectConfig, ObjectEncoder, ObjectUpdate};
+    let bed = Bed::new(&BedChannel::ALL[..12]);
+    let config = ObjectConfig {
+        bed,
+        objects: 32,
+        bitrate_kbps: 768,
+        blocks: Blocks::Six,
+    };
+    let mut enc = ObjectEncoder::new(config).unwrap();
+    let pcm: Vec<f32> = (0..12 * 240)
+        .map(|i| ((i * 7919) % 2000) as f32 / 1000.0 - 1.0)
+        .collect();
+    let mono: Vec<f32> = pcm.iter().step_by(12).copied().collect();
+    let region = Region::new(GLOBAL);
+    let mut frames = 0;
+    for k in 0..100u32 {
+        enc.push_bed(&pcm).unwrap();
+        for o in 0..32u8 {
+            let t = (k + u32::from(o)) as f32 / 50.0 - 1.0;
+            let update = ObjectUpdate {
+                position: [t, -t, 0.5],
+                gain: 1.0,
+                size: 0.2,
+                at_sample: k % 240,
+            };
+            enc.push_object(o, &mono, Some(update)).unwrap();
+        }
+        if k == 60 {
+            enc.end_object(3);
+        }
+        if let Some(f) = enc.pull() {
+            frames += 1;
+            black_box(f.bytes);
+        }
+    }
+    let stats = region.change();
+    assert_eq!(frames, (100 * 240 - 1792) / 1536 + 1);
+    assert_eq!(
+        (stats.allocations, stats.reallocations),
+        (0, 0),
+        "ObjectEncoder: {stats:?}"
+    );
+    frames
 }
