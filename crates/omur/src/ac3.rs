@@ -2,6 +2,7 @@
 //! packing, and channel coupling (§8.2.4) in `coupling`.
 
 pub(crate) mod coupling;
+mod transient;
 
 use crate::bitalloc::{Alloc, MAX_SLOTS, Offsets, curve};
 use crate::bits::{BitWriter, Overflow, crc_shift_back};
@@ -12,6 +13,10 @@ use crate::tables::BITRATES;
 use crate::tuner::{self, Budget};
 use crate::{BLOCK_SAMPLES, Layout, mdct};
 use coupling::Bands;
+
+/// Whether transients switch blocks to the short transform pair (§8.2.2). A build-time
+/// choice for the listening pass, which decides the default.
+const BLOCK_SWITCHING: bool = true;
 
 /// Samples a frame's six windows span: the frame and the 256 past it.
 pub(crate) const SPAN: usize = 6 * BLOCK_SAMPLES + BLOCK_SAMPLES;
@@ -114,6 +119,7 @@ pub(crate) struct Ac3 {
     alloc: Box<[Alloc]>,
     mant: Box<Mantissas>,
     coupling: Option<Box<coupling::Frame>>,
+    transients: transient::Detector,
     /// Bits through block 1 of the last frame, which crc1 must cover.
     #[cfg(test)]
     first_bits: usize,
@@ -171,6 +177,7 @@ impl Ac3 {
                 .collect(),
             mant: Box::new(Mantissas::new()),
             coupling: cpl.map(|b| Box::new(coupling::Frame::new(b))),
+            transients: transient::Detector::default(),
             #[cfg(test)]
             first_bits: 0,
             #[cfg(test)]
@@ -214,6 +221,13 @@ impl Ac3 {
     fn analyse(&mut self) {
         let s = &self.stream;
         let nf = s.nfchans;
+        if BLOCK_SWITCHING {
+            let mut blksw = [[false; 6]; coupling::MAX_FBW];
+            self.transients.detect(&self.pcm[..nf], &mut blksw);
+            for (side, sw) in self.side.iter_mut().zip(blksw).take(nf) {
+                side.blksw = sw;
+            }
+        }
         for (c, p) in self.pcm.iter().enumerate() {
             if let (Some(coef), Some(side)) = (self.coef.get_mut(c), self.side.get(c)) {
                 transform(p, &side.blksw, coef);

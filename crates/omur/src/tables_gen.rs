@@ -1188,3 +1188,16 @@ pub(crate) const POST_SHORT_IM: [f32; 64] = [
     0.0078030895,
     0.007810147,
 ];
+/// The transient detector's 8 kHz high-pass: two biquads, each b0 b1 b2 a1 a2.
+pub(crate) const HIGHPASS: [f32; 10] = [
+    0.41664279,
+    -0.83328557,
+    0.41664279,
+    -0.5555237,
+    0.11104745,
+    0.56331104,
+    -1.1266221,
+    0.56331104,
+    -0.7510814,
+    0.5021628,
+];

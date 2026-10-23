@@ -77,6 +77,26 @@ fn twiddles(
     );
 }
 
+/// The transient detector's 8 kHz high-pass (§8.2.2 step 1): a fourth-order Butterworth at
+/// 48 kHz as two direct form II biquads, by the bilinear transform with the cut-off
+/// prewarped. Each row is b0, b1, b2, a1, a2.
+fn highpass() -> Vec<f64> {
+    let k = (PI * 8_000.0 / 48_000.0).tan();
+    let mut out = Vec::new();
+    for pole in [1.0f64, 3.0] {
+        let q = 1.0 / (2.0 * (pole * PI / 8.0).cos());
+        let norm = 1.0 / (1.0 + k / q + k * k);
+        out.extend([
+            norm,
+            -2.0 * norm,
+            norm,
+            2.0 * (k * k - 1.0) * norm,
+            (1.0 - k / q + k * k) * norm,
+        ]);
+    }
+    out
+}
+
 fn main() {
     let mut out = String::new();
     out.push_str(
@@ -130,6 +150,12 @@ fn main() {
         64,
         -1.0 / 128.0,
         |k| PI * k / 128.0,
+    );
+    table(
+        &mut out,
+        "The transient detector's 8 kHz high-pass: two biquads, each b0 b1 b2 a1 a2.",
+        "HIGHPASS",
+        &highpass(),
     );
     print!("{out}");
 }

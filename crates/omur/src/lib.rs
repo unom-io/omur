@@ -17,7 +17,7 @@
 //!
 //! Object audio (ETSI TS 103 420) is the [`joc`] module, behind the `joc` feature.
 //!
-//! Status: AC-3 2.0 and 5.1, no coupling or block switching yet; E-AC-3 is P2 (`docs/design.md`).
+//! Status: AC-3 2.0 and 5.1 with coupling and block switching; E-AC-3 is P2 (`docs/design.md`).
 
 mod ac3;
 mod bitalloc;

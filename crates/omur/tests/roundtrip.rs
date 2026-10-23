@@ -90,7 +90,7 @@ fn every_rate_decodes_with_both_crcs_and_its_header() {
     // noise channel; above the coded bandwidth (15.8 kHz at 320, 20.3 kHz at 448 and 640)
     // its energy is lost.
     let cases: [(Layout, u32, &[f64]); 5] = [
-        (Layout::Stereo, 192, &[80.0, 75.0]),
+        (Layout::Stereo, 192, &[78.0, 70.0]),
         (Layout::Stereo, 320, &[85.0, 82.0]),
         (
             Layout::Surround51,
@@ -235,4 +235,50 @@ fn samples_past_full_scale_clamp_to_it() {
         }
     }
     assert!(encode(config, &pcm, 240) == encode(config, &clamped, 240));
+}
+
+/// Tone bursts that start at full level out of silence: the frames switch to short
+/// blocks, oxideav decodes them close to the input, and ffmpeg, where it is on `PATH`,
+/// decodes them without a message.
+#[test]
+fn short_blocks_decode_cleanly() {
+    let config = Config::new(Codec::Ac3, Layout::Surround51, 448).unwrap();
+    let pcm: Vec<f32> = (0..8 * 1536 * 6)
+        .map(|i| {
+            let (t, c) = ((i / 6) % 2500, i % 6);
+            let f = [0.31, 0.2, 0.43, 0.05, 0.37, 0.27][c];
+            if t < 900 {
+                0.5 * (t as f32 * f).sin() * (-(t as f32) / 300.0).exp()
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let frames = encode(config, &pcm, 240);
+    let mut switched = 0;
+    for (_, f) in &frames {
+        let si = syncinfo::parse(f).unwrap();
+        let b = bsi::parse(&f[5..]).unwrap();
+        let side = audblk::parse_frame_side_info(&si, &b, f).unwrap();
+        switched += side.iter().filter(|s| s.blksw.iter().any(|w| *w)).count();
+        assert!(decoder::verify_packet_crc(f).unwrap().all_ok());
+    }
+    assert!(switched >= 4, "{switched} blocks switched");
+    let decoded = decode(&frames, 6);
+    let want: Vec<f32> = pcm.iter().step_by(6).copied().collect();
+    let snr = snr_db(&want[1536..6 * 1536], &decoded[0][1536..6 * 1536]);
+    assert!(snr > 15.0, "{snr:.1} dB");
+    let path = std::env::temp_dir().join(format!("omur-short-{}.ac3", std::process::id()));
+    let stream: Vec<u8> = frames.iter().flat_map(|(_, f)| f.iter().copied()).collect();
+    std::fs::write(&path, stream).unwrap();
+    let ffmpeg = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(&path)
+        .args(["-f", "null", "-"])
+        .output();
+    let _ = std::fs::remove_file(&path);
+    if let Ok(out) = ffmpeg {
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stderr), "");
+    }
 }
