@@ -5,9 +5,9 @@ The crate stands outside the workspace and builds on nightly.
 
 | Target | What it holds to |
 |---|---|
-| `encode` | Any AC-3 config, push schedule and f32 (NaN, ±inf, ±1e30, denormals, ±1.0, silence): every frame has `frame_bytes`, both CRCs, our header, and decodes in oxideav-ac3 to finite samples within ±1.001. |
+| `encode` | Any AC-3 or E-AC-3 config, push schedule and f32 (NaN, ±inf, ±1e30, denormals, ±1.0, silence): every frame has `frame_bytes`, its CRCs, our header on each syncframe, and decodes in oxideav-ac3 to finite samples within ±4 (full-scale squares come back past 2 through coupling). |
 | `chunking` | The same input under two push schedules gives byte-identical frames at the same pts. |
-| `api` | Random `push` lengths, `pull` and `Config::new` triples keep the documented errors (`Length`, `Backlog` without consuming, `Layout`, `Bitrate`); a shadow encoder fed only the accepted pushes makes the same frames. |
+| `api` | Random `push` lengths, `pull`, `set_extension` and `Config::new` triples keep the documented errors (`Length`, `Backlog` without consuming, `Layout`, `Bitrate`); a shadow encoder fed only the accepted calls makes the same frames. |
 
 ## Run
 

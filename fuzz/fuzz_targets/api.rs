@@ -1,7 +1,8 @@
-//! Random interleavings of `push`, `pull` and `Config::new` against the documented contract:
-//! `Length` for a partial sample, `Backlog` for a second frame or one past an unread frame,
-//! nothing consumed by a refusal, each frame pulled once, `Layout` and `Bitrate` from
-//! `Config::new`. A shadow encoder takes only the accepted pushes; its frames must match.
+//! Random interleavings of `push`, `pull`, `set_extension` and `Config::new` against the
+//! documented contract: `Length` for a partial sample, `Backlog` for a second frame or one
+//! past an unread frame, nothing consumed by a refusal, each frame pulled once, `Layout` and
+//! `Bitrate` from `Config::new`, `Length` for an extension on AC-3, on 7.1 or past the
+//! frame. A shadow encoder takes only the accepted calls; its frames must match.
 
 #![no_main]
 
@@ -9,7 +10,7 @@ mod common;
 
 use arbitrary::Unstructured;
 use libfuzzer_sys::fuzz_target;
-use omur::{Blocks, Codec, Config, Encoder, Error, Layout};
+use omur::{Codec, Config, Encoder, Error, Layout};
 
 struct Host {
     config: Config,
@@ -26,8 +27,8 @@ impl Host {
     fn new(config: Config) -> Host {
         Host {
             config,
-            enc: Encoder::new(config).expect("an AC-3 encoder"),
-            shadow: Encoder::new(config).expect("an AC-3 encoder"),
+            enc: Encoder::new(config).expect("an encoder"),
+            shadow: Encoder::new(config).expect("an encoder"),
             pushed: 0,
             unread: None,
             seed: 1,
@@ -77,8 +78,31 @@ impl Host {
         }
     }
 
+    /// An extension of `len` bytes: refused on AC-3 and 7.1, taken up to what the frame
+    /// leaves (a frame holds 34 bytes or more, the least on the ladder).
+    fn extension(&mut self, len: usize) {
+        let bytes: Vec<u8> = (0..len).map(|i| i as u8).collect();
+        let got = self.enc.set_extension(&bytes);
+        let carried = matches!(self.config.codec(), Codec::Eac3 { .. })
+            && self.config.layout() != Layout::Surround71;
+        if !carried {
+            assert_eq!(got, Err(Error::Length), "extension of {len} bytes");
+            return;
+        }
+        if len <= 34 {
+            assert_eq!(got, Ok(()), "extension of {len} bytes");
+        }
+        assert!(matches!(got, Ok(()) | Err(Error::Length)), "{got:?}");
+        if got.is_ok() {
+            self.shadow.set_extension(&bytes).expect("shadow extension");
+        }
+    }
+
     fn pull(&mut self) {
         let got = self.enc.pull().map(|f| (f.pts, f.bytes.to_vec()));
+        if let Some(f) = self.enc.pull() {
+            panic!("a second pull of the frame at {}", f.pts);
+        }
         if let Some((pts, _)) = &got {
             let first =
                 (common::frames(self.config, self.pushed) - 1) * self.config.frame_samples();
@@ -93,14 +117,9 @@ impl Host {
 }
 
 /// `Config::new` on the triple these pick; `kbps` overrides the ladder entry `pick` names.
-/// Returns the config when it is AC-3, the one codec an encoder takes today.
+/// Returns the config when it is valid.
 fn config(codec: u8, layout: u8, pick: u8, kbps: Option<u32>) -> Option<Config> {
-    let codec = match codec % 5 {
-        0 => Codec::Ac3,
-        n => Codec::Eac3 {
-            blocks: [Blocks::One, Blocks::Two, Blocks::Three, Blocks::Six][usize::from(n - 1)],
-        },
-    };
+    let codec = common::CODECS[usize::from(codec) % common::CODECS.len()];
     let layout = [Layout::Stereo, Layout::Surround51, Layout::Surround71][usize::from(layout % 3)];
     let ladder = Config::bitrates(codec, layout);
     let entry = ladder.get(usize::from(pick) % ladder.len().max(1));
@@ -127,17 +146,19 @@ fn config(codec: u8, layout: u8, pick: u8, kbps: Option<u32>) -> Option<Config> 
         (c.frame_samples(), c.delay_samples()),
         (samples, samples + 256)
     );
-    // Whole 16-bit words, within half a word of kbps × samples / 384 bytes.
+    // Whole 16-bit words, each syncframe within half a word of its share of
+    // kbps × samples / 384 bytes: within a word for 7.1's pair.
     let bytes = c.frame_bytes() as u64;
     let exact = u64::from(kbps) * samples as u64;
+    let syncframes = 1 + u64::from(layout == Layout::Surround71);
     assert!(
-        bytes.is_multiple_of(2) && (384 * bytes).abs_diff(exact) <= 384,
+        bytes.is_multiple_of(2) && (384 * bytes).abs_diff(exact) <= 384 * syncframes,
         "{c:?}: {bytes} bytes"
     );
     if codec == Codec::Ac3 {
         assert_eq!(bytes, 4 * u64::from(kbps), "{c:?}");
     }
-    (codec == Codec::Ac3).then_some(c)
+    Some(c)
 }
 
 fuzz_target!(|data: &[u8]| {
@@ -150,9 +171,10 @@ fn run(u: &mut Unstructured) -> arbitrary::Result<()> {
     };
     let mut host = Host::new(start);
     while !u.is_empty() {
-        match u.int_in_range(0..=2)? {
+        match u.int_in_range(0..=3)? {
             0 => host.push(usize::from(u.arbitrary::<u16>()?)),
             1 => host.pull(),
+            2 => host.extension(usize::from(u.arbitrary::<u16>()? % 4200)),
             _ => {
                 let c = config(
                     u.arbitrary()?,

@@ -5,7 +5,7 @@
 #![allow(dead_code)]
 
 use arbitrary::{Result, Unstructured};
-use omur::{Codec, Config, Encoder, Error, Layout};
+use omur::{Blocks, Codec, Config, Encoder, Error, Layout};
 
 /// Values a game can hand the encoder that a tone never would.
 const SPECIAL: [f32; 14] = [
@@ -28,18 +28,35 @@ const SPECIAL: [f32; 14] = [
 /// Frames one input encodes past the first; bounds the time an input takes.
 const MAX_FRAMES: usize = 4;
 
-/// An AC-3 config: any layout, any entry of its ladder. `None` for 7.1, which AC-3 refuses.
+/// Every codec: AC-3 and E-AC-3 at each frame length.
+pub const CODECS: [Codec; 5] = [
+    Codec::Ac3,
+    Codec::Eac3 {
+        blocks: Blocks::One,
+    },
+    Codec::Eac3 {
+        blocks: Blocks::Two,
+    },
+    Codec::Eac3 {
+        blocks: Blocks::Three,
+    },
+    Codec::Eac3 {
+        blocks: Blocks::Six,
+    },
+];
+
+/// A config: any codec and layout, any entry of its ladder. `None` for AC-3 7.1, which
+/// `Config::new` refuses.
 pub fn config(u: &mut Unstructured) -> Result<Option<Config>> {
+    let codec = *u.choose(&CODECS)?;
     let layout = *u.choose(&[Layout::Stereo, Layout::Surround51, Layout::Surround71])?;
-    let ladder = Config::bitrates(Codec::Ac3, layout);
+    let ladder = Config::bitrates(codec, layout);
     if ladder.is_empty() {
-        assert_eq!(Config::new(Codec::Ac3, layout, 640), Err(Error::Layout));
+        assert_eq!(Config::new(codec, layout, 640), Err(Error::Layout));
         return Ok(None);
     }
     let kbps = *u.choose(ladder)?;
-    Ok(Some(
-        Config::new(Codec::Ac3, layout, kbps).expect("a ladder entry"),
-    ))
+    Ok(Some(Config::new(codec, layout, kbps).expect("a ladder entry")))
 }
 
 /// One to eight push lengths in samples per channel, each 1 to 4096, used in a cycle.
@@ -99,7 +116,7 @@ pub fn signal(u: &mut Unstructured, config: Config) -> Result<Vec<f32>> {
 /// per `frame_samples` past the first `delay_samples`, in order.
 pub fn encode(config: Config, pcm: &[f32], schedule: &[usize]) -> Vec<(u64, Vec<u8>)> {
     let ch = config.layout().channels();
-    let mut enc = Encoder::new(config).expect("an AC-3 encoder");
+    let mut enc = Encoder::new(config).expect("an encoder");
     let mut out = Vec::new();
     let mut rest = pcm;
     for len in schedule.iter().cycle() {
@@ -134,11 +151,21 @@ pub fn frames(config: Config, samples: usize) -> usize {
     }
 }
 
+/// The syncframes of a frame cover its bytes back to back: one, or 7.1's pair.
+pub fn assert_syncframes(f: &omur::Frame) {
+    let ok = match f.syncframes {
+        [a] => *a == (0..f.bytes.len()),
+        [a, b] => a.start == 0 && a.end == b.start && b.end == f.bytes.len(),
+        _ => false,
+    };
+    assert!(ok, "syncframes {:?} of {} bytes", f.syncframes, f.bytes.len());
+}
+
 fn feed(enc: &mut Encoder, pcm: &[f32], ch: usize, out: &mut Vec<(u64, Vec<u8>)>) {
     match enc.push(pcm) {
         Ok(()) => {
             if let Some(f) = enc.pull() {
-                assert!(matches!(f.syncframes, [r] if *r == (0..f.bytes.len())));
+                assert_syncframes(&f);
                 out.push((f.pts, f.bytes.to_vec()));
             }
         }

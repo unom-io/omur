@@ -254,3 +254,30 @@ fn surround_71_is_a_substream_pair() {
         }
     }
 }
+
+/// A full-scale square wave out of silence, the loudest input there is: band-limiting lifts
+/// it to 1.18 (Gibbs) and the coarse quantisation of short low-rate frames on top, never to
+/// twice full scale.
+#[test]
+fn full_scale_squares_stay_under_twice_full_scale() {
+    let pcm: Vec<f32> = (0..2 * 6000)
+        .map(|i| match i / 2 {
+            t if t < 1000 => 0.0,
+            t if (t / 300) % 2 == 0 => 1.0,
+            _ => -1.0,
+        })
+        .collect();
+    for blocks in BLOCKS {
+        let config = Config::new(eac3(blocks), Layout::Stereo, 128).unwrap();
+        let mut state = decoder::Eac3DecoderState::default();
+        let mut peak = 0f32;
+        for (_, f) in encode(config, &pcm, 4096) {
+            decoder::decode_eac3_packet(&mut state, &f).unwrap();
+            peak = state
+                .indep_pcm_f32()
+                .iter()
+                .fold(peak, |m, v| m.max(v.abs()));
+        }
+        assert!(peak > 1.0 && peak < 2.0, "{blocks:?}: {peak}");
+    }
+}
