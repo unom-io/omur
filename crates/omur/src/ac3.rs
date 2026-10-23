@@ -194,8 +194,24 @@ impl Ac3 {
         }
     }
 
-    /// Encodes the frame in `pcm` into `out`, `frame_bytes` long.
-    pub(crate) fn encode(&mut self, out: &mut [u8]) -> Result<(), Overflow> {
+    /// Encodes the frame in `pcm` into `out`, `frame_bytes` long. A frame the tuner's
+    /// offsets do not fit goes out at the all-zero offsets instead: every `bap` 0, no
+    /// mantissas, which every rate holds.
+    pub(crate) fn encode(&mut self, out: &mut [u8]) {
+        self.analyse();
+        let Ok(budget) = self.size(out) else {
+            return;
+        };
+        let tuned = tuner::tune(&self.alloc, &budget);
+        let written = tuned.map(|off| self.write(out, &budget, &off));
+        if !matches!(written, Some(Ok(()))) {
+            let _ = self.write(out, &budget, &Offsets::default());
+        }
+    }
+
+    /// Everything up to the SNR offsets: transforms, the coupling channel, exponents and
+    /// masking curves.
+    fn analyse(&mut self) {
         let s = &self.stream;
         let nf = s.nfchans;
         for (c, p) in self.pcm.iter().enumerate() {
@@ -209,8 +225,7 @@ impl Ac3 {
                 coupling::form(fbw, cpl, f);
             }
         }
-        let slots = s.slots();
-        for c in 0..slots {
+        for c in 0..s.slots() {
             // absexp, then gainrng and chbwcod where sent
             let fixed = match c {
                 _ if c >= nf => 4,
@@ -226,8 +241,12 @@ impl Ac3 {
                 Some(c) == s.lfe_slot(),
             );
         }
+    }
 
-        // Side information does not depend on the offsets' values: a dry run sizes it.
+    /// Where the mantissas must fit. Side information does not depend on the offsets'
+    /// values: a dry run into `out` sizes it.
+    fn size(&self, out: &mut [u8]) -> Result<Budget, Overflow> {
+        let s = &self.stream;
         let cpl = self.coupling.as_deref();
         let mut budget = Budget {
             header: 0,
@@ -245,9 +264,15 @@ impl Ac3 {
             pack::block_side(&mut w, s, &self.side, cpl, &off, b, None)?;
             budget.side[b] = (w.position() - at) as u32;
         }
-        let off = tuner::tune(&self.alloc, &budget).ok_or(Overflow)?;
-        tuner::fill(&mut self.alloc, &off);
-        let mant = tuner::mantissa_bits(&self.alloc, &off);
+        Ok(budget)
+    }
+
+    /// Writes the frame at `off`.
+    fn write(&mut self, out: &mut [u8], budget: &Budget, off: &Offsets) -> Result<(), Overflow> {
+        let s = &self.stream;
+        let cpl = self.coupling.as_deref();
+        tuner::fill(&mut self.alloc, off);
+        let mant = tuner::mantissa_bits(&self.alloc, off);
         let last_start =
             budget.header + (0..5).map(|b| budget.side[b] + mant[b]).sum::<u32>() + budget.side[5];
         let skips = pack::skips(budget.first.saturating_sub(last_start));
@@ -257,7 +282,7 @@ impl Ac3 {
         let mut w = BitWriter::new(out);
         pack::header(&mut w, s)?;
         for (b, skip) in skips.into_iter().enumerate() {
-            pack::block_side(&mut w, s, &self.side, cpl, &off, b, skip)?;
+            pack::block_side(&mut w, s, &self.side, cpl, off, b, skip)?;
             #[cfg(test)]
             if b == 5 {
                 self.last_start = w.position();
@@ -297,6 +322,36 @@ mod tests {
         }
     }
 
+    /// The fallback frame, all offsets zero, fits every rate with the side information at
+    /// its largest: noise that jumps 60 dB from block to block in every channel, so every
+    /// block sends exponents and coordinates.
+    #[test]
+    fn silence_fits_every_rate() {
+        for layout in [Layout::Stereo, Layout::Surround51] {
+            for &kbps in crate::Config::bitrates(crate::Codec::Ac3, layout) {
+                let mut enc = Ac3::new(layout, kbps);
+                let mut out = vec![0u8; enc.frame_bytes()];
+                let mut seed = 3u32;
+                for (c, p) in enc.pcm_mut().iter_mut().enumerate() {
+                    for (i, v) in p.iter_mut().enumerate() {
+                        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                        let loud = (i / BLOCK_SAMPLES + c).is_multiple_of(2);
+                        let noise = (seed >> 9) as f32 / (1u32 << 22) as f32 - 1.0;
+                        *v = noise * if loud { 0.9 } else { 9e-4 };
+                    }
+                }
+                enc.analyse();
+                let what = format!("{layout:?} {kbps}");
+                let budget = enc.size(&mut out).expect(&what);
+                assert!(tuner::tune(&enc.alloc, &budget).is_some(), "{what}");
+                enc.write(&mut out, &budget, &Offsets::default())
+                    .expect(&what);
+                enc.assert_constraints(&what);
+                assert!(decoder::verify_packet_crc(&out).unwrap().all_ok(), "{what}");
+            }
+        }
+    }
+
     /// Silence and a tone 80 dB down leave most of the frame unused; skip fields, not
     /// auxdata, take the slack ahead of block 5.
     #[test]
@@ -313,7 +368,7 @@ mod tests {
                                 *v = level * (t * 0.05).sin();
                             }
                         }
-                        enc.encode(&mut out).unwrap();
+                        enc.encode(&mut out);
                         enc.assert_constraints(&format!("{layout:?} {kbps} level {level}"));
                         assert!(decoder::verify_packet_crc(&out).unwrap().all_ok());
                         enc.advance();
@@ -340,7 +395,7 @@ mod tests {
                     *v = [0.3, 0.02, 0.1, 0.05, 0.2, 0.0][c] * ((seed >> 9) as f32 / 4e6 - 1.0);
                 }
             }
-            enc.encode(&mut out).unwrap();
+            enc.encode(&mut out);
             let si = syncinfo::parse(&out).unwrap();
             let b = bsi::parse(&out[5..]).unwrap();
             audblk::decode_frame(&mut state, &si, &b, &out, &mut pcm).unwrap();
@@ -398,7 +453,7 @@ mod tests {
                         *v = 0.3 * (t * 0.01 * (c + 1) as f32).sin() + 0.1 * noise;
                     }
                 }
-                enc.encode(&mut out).unwrap();
+                enc.encode(&mut out);
                 enc.assert_constraints(&format!("{layout:?} {kbps}"));
                 let si = syncinfo::parse(&out).unwrap();
                 let b = bsi::parse(&out[5..]).unwrap();

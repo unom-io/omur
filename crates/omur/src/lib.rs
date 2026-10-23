@@ -253,10 +253,10 @@ impl Encoder {
 
     /// Queue interleaved f32 in WAV order, at most one frame ([`Config::frame_samples`],
     /// 1536 on AC-3) per push. Samples are clamped to ±1.0; non-finite ones read as 0. A
-    /// frame is encoded as soon as [`Config::delay_samples`] have arrived past its start.
-    /// [`Error::Backlog`] refuses, and consumes nothing of, a push that would complete a
-    /// frame while the last one is unread, or complete two — which a push longer than a
-    /// frame can.
+    /// frame is encoded as soon as [`Config::delay_samples`] have arrived past its start,
+    /// and every frame comes out. [`Error::Backlog`] refuses, and consumes nothing of, a
+    /// push that would complete a frame while the last one is unread, or complete two —
+    /// which a push longer than a frame can.
     pub fn push(&mut self, pcm: &[f32]) -> Result<(), Error> {
         let channels = self.config.layout.channels();
         if !pcm.len().is_multiple_of(channels) {
@@ -287,7 +287,8 @@ impl Encoder {
             self.fill += take;
             left -= take;
             if self.fill == ac3::SPAN {
-                self.ready = self.core.encode(&mut self.out).is_ok();
+                self.core.encode(&mut self.out);
+                self.ready = true;
                 self.out_pts = self.pts;
                 self.pts += self.config.frame_samples() as u64;
                 self.core.advance();
