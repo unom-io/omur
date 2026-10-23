@@ -110,49 +110,99 @@ impl Quad {
         }
         e.max(0.0)
     }
+}
 
-    /// The minimiser, regularised toward `toward` by `1e-3` of the mean diagonal plus
-    /// `floor`, through a Cholesky factorisation: a band the core leaves empty keeps the
-    /// matrix it was pulled to. The regularisation bounds the condition number near 5,000,
-    /// which f32 resolves far below a quantiser step.
+/// Quadratics per band, a field at a time: band `b`'s is `a[b]`, `lin[c][b]`, `q[p][b]`, so
+/// that every step of a fit runs over the bands side by side.
+#[derive(Clone, Copy, Default)]
+struct Sums {
+    a: [f32; SPLIT],
+    lin: [[f32; SPLIT]; CH],
+    q: [[f32; SPLIT]; 15],
+}
+
+impl Sums {
+    fn add(&mut self, b: usize, o: &Quad) {
+        self.a[b] += o.a;
+        for (x, y) in self.lin.iter_mut().zip(o.lin) {
+            x[b] += y;
+        }
+        for (x, y) in self.q.iter_mut().zip(o.q) {
+            x[b] += y;
+        }
+    }
+
+    /// Each of the first `nb` bands' minimiser, by channel and band, regularised toward
+    /// `toward` by `1e-3` of the mean diagonal plus `floor`, through a Cholesky
+    /// factorisation: a band the core leaves empty keeps the matrix it was pulled to. The
+    /// regularisation bounds the condition number near 5,000, which f32 resolves far below
+    /// a quantiser step. Each step runs over the bands.
     #[allow(clippy::needless_range_loop)] // the factorisation reads clearest by index
-    fn solve(&self, toward: &[f32; CH], floor: f32) -> [f32; CH] {
-        let trace: f32 = (0..CH).map(|c| self.q[pair(c, c)]).sum();
-        let lambda = 1e-3 * trace / CH as f32 + floor + 1e-30;
-        let mut l = [[0f32; CH]; CH];
-        let mut inv = [0f32; CH];
+    fn solve(&self, toward: &[[f32; SPLIT]; CH], floor: f32, nb: usize) -> [[f32; SPLIT]; CH] {
+        let nb = nb.min(SPLIT);
+        let mut lambda = [0f32; SPLIT];
+        for b in 0..nb {
+            let trace = (0..CH).map(|c| self.q[pair(c, c)][b]).sum::<f32>();
+            lambda[b] = 1e-3 * trace / CH as f32 + floor + 1e-30;
+        }
+        let mut l = [[[0f32; SPLIT]; CH]; CH];
+        let mut inv = [[0f32; SPLIT]; CH];
         for i in 0..CH {
             for j in 0..=i {
-                let mut s = self.q[pair(i, j)] + if i == j { lambda } else { 0.0 };
-                for k in 0..j {
-                    s -= l[i][k] * l[j][k];
-                }
-                if i == j {
-                    l[i][i] = s.max(1e-30).sqrt();
-                    inv[i] = 1.0 / l[i][i];
-                } else {
-                    l[i][j] = s * inv[j];
+                for b in 0..nb {
+                    let mut s = self.q[pair(i, j)][b] + if i == j { lambda[b] } else { 0.0 };
+                    for k in 0..j {
+                        s -= l[i][k][b] * l[j][k][b];
+                    }
+                    if i == j {
+                        l[i][i][b] = s.max(1e-30).sqrt();
+                        inv[i][b] = 1.0 / l[i][i][b];
+                    } else {
+                        l[i][j][b] = s * inv[j][b];
+                    }
                 }
             }
         }
         // (q + λ) m = -lin / 2 + λ·toward
-        let mut z = [0f32; CH];
+        let mut z = [[0f32; SPLIT]; CH];
         for i in 0..CH {
-            let mut s = -0.5 * self.lin[i] + lambda * toward[i];
-            for k in 0..i {
-                s -= l[i][k] * z[k];
+            for b in 0..nb {
+                let mut s = -0.5 * self.lin[i][b] + lambda[b] * toward[i][b];
+                for k in 0..i {
+                    s -= l[i][k][b] * z[k][b];
+                }
+                z[i][b] = s * inv[i][b];
             }
-            z[i] = s * inv[i];
         }
-        let mut m = [0f32; CH];
+        let mut m = [[0f32; SPLIT]; CH];
         for i in (0..CH).rev() {
-            let mut s = z[i];
-            for k in i + 1..CH {
-                s -= l[k][i] * m[k];
+            for b in 0..nb {
+                let mut s = z[i][b];
+                for k in i + 1..CH {
+                    s -= l[k][i][b] * m[k][b];
+                }
+                m[i][b] = s * inv[i][b];
             }
-            m[i] = s * inv[i];
         }
-        m.map(|v| if v.is_finite() { v } else { 0.0 })
+        m.map(|m| m.map(|v| if v.is_finite() { v } else { 0.0 }))
+    }
+
+    /// [`Quad::eval`] of the first `nb` bands at `m`, by channel and band.
+    fn eval(&self, m: &[[f32; SPLIT]; CH], nb: usize) -> [f32; SPLIT] {
+        let nb = nb.min(SPLIT);
+        let mut e = self.a;
+        for (l, m) in self.lin.iter().zip(m) {
+            for b in 0..nb {
+                e[b] += l[b] * m[b];
+            }
+        }
+        for (q, &(c, d)) in self.q.iter().zip(&PAIRS) {
+            let twice = if c == d { 1.0 } else { 2.0 };
+            for b in 0..nb {
+                e[b] += twice * q[b] * m[c][b] * m[d][b];
+            }
+        }
+        e.map(|e| e.max(0.0))
     }
 }
 
@@ -187,10 +237,11 @@ impl Quant {
 
     /// `joc_mtx` code word and length of a difference of value indices (Pseudocode 3).
     fn mtx(self, delta: i32) -> (u32, u8) {
-        let s = delta.rem_euclid(self.steps()) as usize;
         if self.fine {
+            let s = delta.rem_euclid(192) as usize;
             (FINE_MTX_CODE[s], FINE_MTX_LEN[s])
         } else {
+            let s = delta.rem_euclid(96) as usize;
             (COARSE_MTX_CODE[s], COARSE_MTX_LEN[s])
         }
     }
@@ -198,10 +249,12 @@ impl Quant {
     /// `joc_vec` code word of a sparse band's value index, counted from the sparse offset
     /// of Pseudocode 2 (50 or 100 steps, two or four above the centre).
     fn vec(self, v: i16) -> (u32, u8) {
-        let s = (i32::from(v) - self.sparse()).rem_euclid(self.steps()) as usize;
+        let s = i32::from(v) - self.sparse();
         if self.fine {
+            let s = s.rem_euclid(192) as usize;
             (FINE_VEC_CODE[s], FINE_VEC_LEN[s])
         } else {
+            let s = s.rem_euclid(96) as usize;
             (COARSE_VEC_CODE[s], COARSE_VEC_LEN[s])
         }
     }
@@ -534,16 +587,15 @@ impl Joc {
         }
     }
 
-    /// Codes element `k` at rung `(fine, bands)` under `mode`, fitting each band of `fit`
-    /// (one set per data point), scoring it on `score` and counting its bits; `pre` is
-    /// error the mode fixes.
+    /// Codes element `k` at rung `(fine, bands)` under `mode`, fitting and scoring each band
+    /// of `fit` (one set per data point) and counting its bits; `pre` is error the mode
+    /// fixes.
     fn code(
         &self,
         k: usize,
         mode: Mode,
         rung: (bool, u8),
         fit: [&[Quad; SPLIT]; 2],
-        score: [&[Quad; SPLIT]; 2],
         pre: f32,
     ) -> Coded {
         let quant = Quant { fine: rung.0 };
@@ -564,36 +616,35 @@ impl Joc {
             err: pre,
         };
         let points = c.points();
-        for (dp, (quads, scored)) in fit.iter().zip(score).enumerate().take(points) {
-            let mut band = [Quad::default(); SPLIT];
-            let mut scores = [Quad::default(); SPLIT];
-            let mut toward = [[0f32; CH]; SPLIT];
+        let seen = &self.seen[k];
+        let all: f32 = seen.iter().sum();
+        for (dp, quads) in fit.iter().enumerate().take(points) {
+            let mut band = Sums::default();
+            let mut toward = [[0f32; SPLIT]; CH];
             let mut width = [0f32; SPLIT];
             let mut used = [0f32; SPLIT];
-            let seen = &self.seen[k];
-            let all: f32 = seen.iter().sum();
-            for (g, (q, s)) in quads.iter().zip(scored.iter()).enumerate() {
+            for (g, q) in quads.iter().enumerate() {
                 let b = atom_band(bands, g);
-                band[b].add(q);
-                scores[b].add(s);
+                band.add(b, q);
                 used[b] += seen[g];
-                for (t, p) in toward[b].iter_mut().zip(self.prev[k][g]) {
-                    *t += p;
+                for (t, p) in toward.iter_mut().zip(self.prev[k][g]) {
+                    t[b] += p;
                 }
                 width[b] += 1.0;
             }
-            for (b, q) in band.iter().enumerate().take(nb) {
-                let toward = if used[b] > 1e-4 * all {
-                    toward[b].map(|v| v / width[b].max(1.0))
-                } else {
-                    [0.0; CH]
-                };
-                let m = q.solve(&toward, self.floor);
-                for ch in 0..CH {
+            for b in 0..SPLIT {
+                let pull = used[b] > 1e-4 * all;
+                for t in toward.iter_mut() {
+                    t[b] = if pull { t[b] / width[b].max(1.0) } else { 0.0 };
+                }
+            }
+            let m = band.solve(&toward, self.floor, nb);
+            for ((v, m), toward) in c.v[dp].iter_mut().zip(&m).zip(&toward) {
+                for b in 0..nb {
                     // within three quarters of a step of the held value, hold it
-                    let held = quant.index(toward[ch]);
-                    let near = (m[ch] / quant.step() - f32::from(held)).abs() < 0.75;
-                    c.v[dp][ch][b] = if near { held } else { quant.index(m[ch]) };
+                    let held = quant.index(toward[b]);
+                    let near = (m[b] / quant.step() - f32::from(held)).abs() < 0.75;
+                    v[b] = if near { held } else { quant.index(m[b]) };
                 }
             }
             for ch in 0..CH {
@@ -604,8 +655,9 @@ impl Joc {
                     last = v;
                 }
             }
-            for (b, q) in scores.iter().enumerate().take(nb) {
-                c.err += q.eval(&std::array::from_fn(|ch| quant.value(c.v[dp][ch][b])));
+            let values = c.v[dp].map(|v| v.map(|v| quant.value(v)));
+            for e in band.eval(&values, nb).iter().take(nb) {
+                c.err += e;
             }
         }
         // one band and one channel carrying it: sparse, if no worse for fewer bits
@@ -613,14 +665,16 @@ impl Joc {
             let mut sparse = c;
             sparse.bits = c.bits - (0..points).map(|dp| self.dense_bits(&c, dp)).sum::<u32>();
             sparse.err = pre;
+            let mut whole = [Quad::default(); 2];
+            for (w, quads) in whole.iter_mut().zip(fit).take(points) {
+                for g in quads.iter() {
+                    w.add(g);
+                }
+            }
             let mut best: Option<(u8, [i16; 2], f32)> = None;
             for keep in 0..CH {
                 let (mut err, mut vs) = (0f32, [0i16; 2]);
-                for (dp, quads) in score.iter().enumerate().take(points) {
-                    let mut q = Quad::default();
-                    for g in quads.iter() {
-                        q.add(g);
-                    }
+                for (dp, q) in whole.iter().enumerate().take(points) {
                     let other = quant.value(quant.sparse() as i16);
                     let mut m = [other; CH];
                     let mut lin = q.lin[keep];
@@ -692,12 +746,9 @@ impl Joc {
         let f = &self.fits[k];
         match mode {
             Mode::Reuse => Coded::reuse(f.reuse),
-            Mode::Smooth => self.code(k, mode, r, [&f.smooth; 2], [&f.smooth; 2], 0.0),
-            Mode::Jump => self.code(k, mode, r, [&f.jump; 2], [&f.jump; 2], f.pre),
-            Mode::Steep(_) => {
-                let halves = [&f.first, &f.second];
-                self.code(k, mode, r, halves, halves, f.pre)
-            }
+            Mode::Smooth => self.code(k, mode, r, [&f.smooth; 2], 0.0),
+            Mode::Jump => self.code(k, mode, r, [&f.jump; 2], f.pre),
+            Mode::Steep(_) => self.code(k, mode, r, [&f.first, &f.second], f.pre),
         }
     }
 
@@ -775,8 +826,10 @@ impl Joc {
         }
         let limit = 8 * budget as u32;
         let total = |coded: &[Coded]| HEADER_BITS + coded.iter().map(|c| c.bits).sum::<u32>();
-        for k in 0..n {
-            self.next[k] = self.down(k);
+        if total(&self.coded).div_ceil(8) * 8 > limit {
+            for k in 0..n {
+                self.next[k] = self.down(k);
+            }
         }
         while total(&self.coded).div_ceil(8) * 8 > limit {
             let mut pick: Option<(usize, f32)> = None;
@@ -897,9 +950,11 @@ mod tests {
             q.q[pair(c, c)] = power[c];
             q.lin[c] = -2.0 * truth[c] * power[c];
         }
-        let m = q.solve(&[0.0; CH], 0.0);
+        let mut s = Sums::default();
+        s.add(0, &q);
+        let m = s.solve(&[[0.0; SPLIT]; CH], 0.0, 1);
         for c in 0..CH {
-            assert!((m[c] - truth[c]).abs() < 1e-2, "{m:?}");
+            assert!((m[c][0] - truth[c]).abs() < 1e-2, "{m:?}");
         }
         let quant = Quant { fine: false };
         assert_eq!(quant.index(1.5), 7); // 7 × 0.2002 = 1.401, 8 × = 1.602
