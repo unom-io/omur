@@ -39,9 +39,9 @@ fn run(u: &mut Unstructured) -> arbitrary::Result<()> {
         let got = (b.bsid, b.acmod, b.lfeon, b.dialnorm);
         assert_eq!(got, (8, acmod, lfeon, 31), "bsi of frame {k}");
         audblk::decode_frame(&mut state, &si, &b, f, &mut out).expect("decode");
-        // Quantised, band-limited full-scale audio overshoots by a few percent; the input
-        // itself is clamped to ±1.0 at push.
-        if let Some(s) = out.iter().find(|s| !s.is_finite() || s.abs() > 1.1) {
+        // Input clamped to ±1.0 and coded with 3-level quantisers overshoots the rail by
+        // tens of percent on a square wave; the bound catches garbage, not that.
+        if let Some(s) = out.iter().find(|s| !s.is_finite() || s.abs() > 2.0) {
             panic!("frame {k} decodes to {s}");
         }
     }
