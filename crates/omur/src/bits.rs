@@ -59,13 +59,22 @@ impl<'a> BitWriter<'a> {
         Ok(())
     }
 
-    /// Writes `code[i]` in `bits[i]` bits for every `i`, each 16 bits at most.
+    /// Writes `code[i]` in `bits[i]` bits for every `i`, each 16 bits at most, two to a put.
     pub(crate) fn put_all(&mut self, code: &[u16], bits: &[u8]) -> Result<(), Overflow> {
         let total: usize = bits.iter().map(|b| usize::from(*b)).sum();
         if bits.iter().any(|b| *b > 16) || self.position() + total > self.buf.len() * 8 {
             return Err(Overflow);
         }
-        for (v, n) in code.iter().zip(bits) {
+        let field = |v: u16, n: u8| u32::from(v) & ((1u32 << n) - 1);
+        let mut pairs = code.chunks_exact(2).zip(bits.chunks_exact(2));
+        for (v, n) in &mut pairs {
+            let (n0, n1) = (n[0], n[1]);
+            let both = (field(v[0], n0) << n1) | field(v[1], n1);
+            self.push(both, u32::from(n0) + u32::from(n1));
+        }
+        if let (Some(v), Some(n)) = (code.get(bits.len() & !1), bits.last())
+            && bits.len() % 2 == 1
+        {
             self.push(u32::from(*v), u32::from(*n));
         }
         Ok(())
