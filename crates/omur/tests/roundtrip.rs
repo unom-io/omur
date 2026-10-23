@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{encode, ladder, signal};
+use common::{encode, ffmpeg_decodes, ladder, signal};
 use omur::{Codec, Config, Encoder, Error, Layout};
 use oxideav_ac3::{audblk, bsi, decoder, syncinfo};
 
@@ -96,6 +96,26 @@ fn every_rate_decodes_with_both_crcs_and_its_header() {
                 "{layout:?} {kbps}: channel {c} at {snr:.1} dB"
             );
         }
+    }
+}
+
+/// Every AC-3 entry of the ladder: both CRCs, an oxideav decode, and ffmpeg, where it is on
+/// `PATH`, without a message.
+#[test]
+fn every_ac3_rate_decodes_in_both_decoders() {
+    for config in ladder().into_iter().filter(|c| c.codec() == Codec::Ac3) {
+        let pcm = signal(config.layout(), 6 * 1536);
+        let frames = encode(config, &pcm, 240);
+        for (_, f) in &frames {
+            assert!(
+                decoder::verify_packet_crc(f).unwrap().all_ok(),
+                "{config:?}"
+            );
+        }
+        decode(&frames, config.layout().channels());
+        let stream: Vec<u8> = frames.iter().flat_map(|(_, f)| f.clone()).collect();
+        let what = format!("{:?}-{}.ac3", config.layout(), config.bitrate_kbps());
+        ffmpeg_decodes(&stream, &what);
     }
 }
 
@@ -221,17 +241,6 @@ fn short_blocks_decode_cleanly() {
     let want: Vec<f32> = pcm.iter().step_by(6).copied().collect();
     let snr = snr_db(&want[1536..6 * 1536], &decoded[0][1536..6 * 1536]);
     assert!(snr > 15.0, "{snr:.1} dB");
-    let path = std::env::temp_dir().join(format!("omur-short-{}.ac3", std::process::id()));
     let stream: Vec<u8> = frames.iter().flat_map(|(_, f)| f.iter().copied()).collect();
-    std::fs::write(&path, stream).unwrap();
-    let ffmpeg = std::process::Command::new("ffmpeg")
-        .args(["-v", "error", "-i"])
-        .arg(&path)
-        .args(["-f", "null", "-"])
-        .output();
-    let _ = std::fs::remove_file(&path);
-    if let Ok(out) = ffmpeg {
-        assert!(out.status.success());
-        assert_eq!(String::from_utf8_lossy(&out.stderr), "");
-    }
+    ffmpeg_decodes(&stream, "short.ac3");
 }

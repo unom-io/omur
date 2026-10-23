@@ -81,3 +81,20 @@ pub fn encode(config: Config, pcm: &[f32], chunk: usize) -> Vec<(u64, Vec<u8>)> 
     }
     out
 }
+
+/// ffmpeg, where it is on `PATH`, decodes `stream` without a message. `name` ends in the
+/// stream's extension.
+pub fn ffmpeg_decodes(stream: &[u8], name: &str) {
+    let path = std::env::temp_dir().join(format!("omur-{}-{name}", std::process::id()));
+    std::fs::write(&path, stream).unwrap();
+    let out = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(&path)
+        .args(["-f", "null", "-"])
+        .output();
+    let _ = std::fs::remove_file(&path);
+    if let Ok(out) = out {
+        assert!(out.status.success(), "{name}");
+        assert_eq!(String::from_utf8_lossy(&out.stderr), "", "{name}");
+    }
+}

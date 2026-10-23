@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::{encode, signal};
+use common::{encode, ffmpeg_decodes, signal};
 use omur::{Blocks, Codec, Config, Layout};
 use oxideav_ac3::decoder::verify_packet_crc;
 use oxideav_ac3::eac3::{audfrm, bsi, decoder};
@@ -42,22 +42,6 @@ fn snr_db(want: &[f32], got: &[f32]) -> f64 {
         e += (*w as f64 - *g as f64).powi(2);
     }
     10.0 * (s / e).log10()
-}
-
-/// ffmpeg, where it is on `PATH`, decodes `stream` without a message.
-fn ffmpeg_decodes(stream: &[u8], what: &str) {
-    let path = std::env::temp_dir().join(format!("omur-{}-{what}.ec3", std::process::id()));
-    std::fs::write(&path, stream).unwrap();
-    let out = std::process::Command::new("ffmpeg")
-        .args(["-v", "error", "-i"])
-        .arg(&path)
-        .args(["-f", "null", "-"])
-        .output();
-    let _ = std::fs::remove_file(&path);
-    if let Ok(out) = out {
-        assert!(out.status.success(), "{what}");
-        assert_eq!(String::from_utf8_lossy(&out.stderr), "", "{what}");
-    }
 }
 
 #[test]
@@ -120,7 +104,7 @@ fn every_length_and_rate_decodes_with_its_header() {
                     assert!(snr > floor[c], "{what}: channel {c} at {snr:.1} dB");
                 }
                 let stream: Vec<u8> = frames.iter().flat_map(|(_, f)| f.clone()).collect();
-                ffmpeg_decodes(&stream, &what.replace(' ', "-"));
+                ffmpeg_decodes(&stream, &format!("{}.ec3", what.replace(' ', "-")));
             }
         }
     }
@@ -176,7 +160,7 @@ fn extensions_ride_the_next_frames_skip_fields() {
             assert_eq!(state.frames_zero_filled, 0, "{what}");
             assert!(verify_packet_crc(f).unwrap().all_ok(), "{what}");
         }
-        ffmpeg_decodes(&frames.concat(), &format!("ext-{blocks:?}-{kbps}"));
+        ffmpeg_decodes(&frames.concat(), &format!("ext-{blocks:?}-{kbps}.ec3"));
     }
 }
 
@@ -250,7 +234,7 @@ fn surround_71_is_a_substream_pair() {
                 assert!(snr > floor[c + 5], "{what}: fold {c} at {snr:.1} dB");
             }
             let stream: Vec<u8> = frames.iter().flat_map(|(_, f)| f.clone()).collect();
-            ffmpeg_decodes(&stream, &format!("71-{blocks:?}-{kbps}"));
+            ffmpeg_decodes(&stream, &format!("71-{blocks:?}-{kbps}.ec3"));
         }
     }
 }
