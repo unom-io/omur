@@ -73,7 +73,7 @@ pub(crate) fn header(
     if chanmap.is_none() && !six {
         w.put(u32::from(group), 1)?; // convsync
     }
-    w.put(0, 1)?; // addbsie
+    addbsi(w, s)?;
 
     if six {
         w.put(0b10, 2)?; // expstre, ahte
@@ -118,6 +118,30 @@ pub(crate) fn header(
     Ok(())
 }
 
+/// `addbsie` and, on an object-audio stream, `addbsil` and the two bytes of TS 103 420
+/// clause 8.3 that signal the extension.
+#[cfg(feature = "joc")]
+fn addbsi(w: &mut BitWriter, s: &Stream) -> Result<(), Overflow> {
+    match s.syntax {
+        crate::pack::Syntax::Eac3 {
+            objects: Some(n), ..
+        } => {
+            w.put(1, 1)?;
+            w.put(1, 6)?; // addbsil: two bytes
+            for b in crate::joc::addbsi(n) {
+                w.put(u32::from(b), 8)?;
+            }
+            Ok(())
+        }
+        _ => w.put(0, 1),
+    }
+}
+
+#[cfg(not(feature = "joc"))]
+fn addbsi(w: &mut BitWriter, _: &Stream) -> Result<(), Overflow> {
+    w.put(0, 1) // addbsie
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,5 +164,30 @@ mod tests {
     #[test]
     fn the_71_map_names_ls_rs_and_the_rear_pair() {
         assert_eq!(CHANMAP_71, 0b0001_1010_0000_0000);
+    }
+
+    /// An object-audio stream's BSI carries TS 103 420's two bytes, as oxideav reads them.
+    #[cfg(feature = "joc")]
+    #[test]
+    fn an_object_stream_signals_extension_type_a() {
+        use crate::{Blocks, Codec, Config, Encoder, Layout};
+        use oxideav_ac3::eac3::{bsi, joc::parse_ec3_extension_type_a};
+        let six = Codec::Eac3 {
+            blocks: Blocks::Six,
+        };
+        let config = Config::new(six, Layout::Surround51, 768).unwrap();
+        let mut enc = Encoder::objects(config, 11);
+        enc.push(&[0.25; 6 * 1536]).unwrap();
+        enc.push(&[0.25; 6 * 256]).unwrap();
+        let frame = enc.pull().unwrap();
+        let b = bsi::parse(&frame.bytes[2..]).unwrap();
+        let addbsi = b.addbsi.as_ref().unwrap().payload();
+        assert_eq!(addbsi, [1, 11]);
+        assert!(parse_ec3_extension_type_a(addbsi).unwrap().is_some());
+        assert!(
+            oxideav_ac3::decoder::verify_packet_crc(frame.bytes)
+                .unwrap()
+                .all_ok()
+        );
     }
 }

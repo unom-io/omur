@@ -3,6 +3,7 @@
 //! `--features joc`; no tag that contains this module is published before its release gate
 //! clears (docs/design.md §8, §12).
 
+#[allow(dead_code)]
 mod emdf;
 mod matrix;
 mod oamd;
@@ -12,6 +13,8 @@ mod render;
 mod tables;
 
 use crate::{Blocks, Codec, Config, Error, Frame, Layout};
+
+pub(crate) use emdf::addbsi;
 
 /// Elements one stream carries, bed channels and objects together.
 pub const MAX_ELEMENTS: usize = 16;

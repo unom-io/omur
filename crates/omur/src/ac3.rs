@@ -428,7 +428,7 @@ impl Ac3 {
         let group = self.group == 0;
         match s.syntax {
             Syntax::Ac3 { frmsizecod, .. } => pack::header(w, s, frmsizecod),
-            Syntax::Eac3 { chanmap } => eac3::header(w, s, chanmap, &self.side, group, off),
+            Syntax::Eac3 { chanmap, .. } => eac3::header(w, s, chanmap, &self.side, group, off),
         }
     }
 

@@ -22,8 +22,12 @@ pub(crate) enum Syntax {
         crc1_back: u16,
     },
     /// Annex E, `bsid` 16: one CRC over the frame, no 5/8 rule. A dependent substream
-    /// carries its `chanmap`.
-    Eac3 { chanmap: Option<u16> },
+    /// carries its `chanmap`; an object-audio stream its object count, in `addbsi`.
+    Eac3 {
+        chanmap: Option<u16>,
+        #[cfg(feature = "joc")]
+        objects: Option<u8>,
+    },
 }
 
 impl Syntax {
@@ -63,7 +67,7 @@ impl Stream {
 
     /// An E-AC-3 independent substream: the one that carries the converter fields.
     pub(crate) fn independent(&self) -> bool {
-        matches!(self.syntax, Syntax::Eac3 { chanmap: None })
+        matches!(self.syntax, Syntax::Eac3 { chanmap: None, .. })
     }
 
     /// Bits from the frame's start to where crc1 closes, on AC-3.

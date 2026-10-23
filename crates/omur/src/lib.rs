@@ -182,7 +182,11 @@ impl Config {
             kbps,
             frame_bytes,
             blocks,
-            syntax: pack::Syntax::Eac3 { chanmap },
+            syntax: pack::Syntax::Eac3 {
+                chanmap,
+                #[cfg(feature = "joc")]
+                objects: None,
+            },
         };
         match self.layout {
             Layout::Stereo => (core(2, false, independent, kbps, None), None),
@@ -308,12 +312,28 @@ impl Encoder {
     /// Allocates everything the stream needs. A [`Config`] is valid once built, so every
     /// one constructs.
     pub fn new(config: Config) -> Result<Encoder, Error> {
-        use Source::{Fold, Wav};
         let (core, dep) = config.cores();
+        Ok(Encoder::with_cores(config, core, dep))
+    }
+
+    /// An E-AC-3 encoder whose independent substream's `addbsi` signals object audio with
+    /// `objects` objects (TS 103 420 clause 8.3).
+    #[cfg(feature = "joc")]
+    #[allow(dead_code)]
+    pub(crate) fn objects(config: Config, objects: u8) -> Encoder {
+        let (mut core, dep) = config.cores();
+        if let pack::Syntax::Eac3 { objects: o, .. } = &mut core.syntax {
+            *o = Some(objects);
+        }
+        Encoder::with_cores(config, core, dep)
+    }
+
+    fn with_cores(config: Config, core: ac3::Core, dep: Option<ac3::Core>) -> Encoder {
+        use Source::{Fold, Wav};
         let (core, dep) = (ac3::Ac3::new(core), dep.map(ac3::Ac3::new));
         let first = core.frame_bytes();
         let bytes = config.frame_bytes();
-        Ok(Encoder {
+        Encoder {
             config,
             core,
             dep,
@@ -333,7 +353,7 @@ impl Encoder {
             out_pts: 0,
             ready: false,
             syncframes: [0..first, first..bytes],
-        })
+        }
     }
 
     pub fn config(&self) -> Config {
