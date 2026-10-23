@@ -1,11 +1,13 @@
 //! Rate control: picks the SNR offsets that fill the frame (§8.2.12). A frame-wide search
 //! over `csnroffst` and one shared `fsnroffst` comes first; then each slot's own fine offset
-//! climbs, the cheapest step first, while the frame still holds it. Each candidate is a bit
+//! climbs, the cheapest step first, while the frame still holds it. E-AC-3, whose slots
+//! share the fine offset, spends what the search leaves on fast gain codes instead. Each candidate is a bit
 //! tally — packed `bap` costs per block, priced by the grouping rule — never a `bap` array;
 //! only the winner's arrays are written (docs/design.md §5).
 
 use crate::bitalloc::{
-    Alloc, FLOORCOD, MAX_END, MAX_SLOTS, Offsets, for_each_address, for_each_bap, snr_offset,
+    Alloc, FGAINCOD, FLOORCOD, MAX_END, MAX_SLOTS, Offsets, for_each_address, for_each_bap,
+    masking, snr_offset,
 };
 use crate::mantissas::{PACKED, block_bits};
 use crate::tables::{BAPTAB, BNDSZ, BNDTAB, FLOORTAB, MASKTAB};
@@ -28,7 +30,7 @@ pub(crate) struct Budget {
 const SKIP_SLACK: u32 = 16;
 
 /// Packed mantissa cost (`mantissas::PACKED`) per block.
-type Tally = [u64; 6];
+pub(crate) type Tally = [u64; 6];
 
 /// `PACKED` by bit-allocation address.
 const BY_ADDRESS: [u64; 64] = {
@@ -41,6 +43,15 @@ const BY_ADDRESS: [u64; 64] = {
     t
 };
 
+/// The packed cost of one set's mantissas, `psd` against `mask`, at `offset`.
+fn set_cost(psd: &[i16; 256], mask: &[i16; 50], start: usize, end: usize, offset: i32) -> u64 {
+    let mut sum = 0u64;
+    for_each_address(psd, mask, start, end, offset, |_, ad| {
+        sum += BY_ADDRESS[ad & 63];
+    });
+    sum
+}
+
 /// Channel `a`'s tally at `offset`: each set's cost in every block that uses it.
 fn channel(a: &Alloc, offset: i32) -> Tally {
     let mut t = [0u64; 6];
@@ -48,10 +59,7 @@ fn channel(a: &Alloc, offset: i32) -> Tally {
         if a.set[s] != s {
             continue;
         }
-        let mut sum = 0u64;
-        for_each_address(&a.psd[s], &a.mask[s], a.start, a.end, offset, |_, ad| {
-            sum += BY_ADDRESS[ad & 63];
-        });
+        let sum = set_cost(&a.psd[s], &a.mask[s], a.start, a.end, offset);
         for (blk, t) in t.iter_mut().enumerate().take(a.blocks).skip(s) {
             if a.set[blk] == s {
                 *t = sum;
@@ -150,34 +158,54 @@ fn tally(alloc: &[Alloc], off: &Offsets) -> Tally {
 /// ones, which gain 0.5 dB on FL and FR at 320 kbit/s for 0.1 dB on the noise channels.
 const GIVE: u8 = 4;
 
-/// The offsets the frame is coded with: the largest `16·csnroffst + fsnroffst` shared by
-/// every slot, searched outwards from `hint` (the last frame's, set to this one's) and then
-/// halved; then, unless the fine offset is `shared`, from `GIVE` steps under it, one more
-/// fine step at a time for the slot whose step costs fewest bits, while the frame holds it.
-/// `None` if not even silence fits.
-pub(crate) fn tune(
-    alloc: &[Alloc],
-    budget: &Budget,
-    hint: &mut u32,
-    shared: bool,
-) -> Option<Offsets> {
-    let slots = alloc.len().min(MAX_SLOTS);
-    let at = |v: u32| Offsets {
+/// Every slot at `16·csnroffst + fsnroffst` = `v`.
+pub(crate) fn at(v: u32) -> Offsets {
+    Offsets {
         csnr: (v >> 4) as u8,
         fsnr: [(v & 15) as u8; MAX_SLOTS],
-    };
+        gains: None,
+    }
+}
+
+/// The largest `v = 16·csnroffst + fsnroffst` shared by every slot that the frame holds,
+/// searched outwards from `hint` and then halved, with each slot's tally there. `None` if
+/// not even silence fits.
+pub(crate) fn search(
+    alloc: &[Alloc],
+    budget: &Budget,
+    hint: u32,
+) -> Option<(u32, [Tally; MAX_SLOTS])> {
     if !fits(&[0; 6], budget) {
         return None;
     }
-    let holds = |v: u32| v == 0 || fits(&tally(alloc, &at(v)), budget);
+    let mut here = [[0u64; 6]; MAX_SLOTS];
+    let mut best = here;
+    // v = 0 holds: every bap is zero (§7.2.2.1)
+    let mut holds = |v: u32, keep: &mut [Tally; MAX_SLOTS]| {
+        if v == 0 {
+            *keep = [[0; 6]; MAX_SLOTS];
+            return true;
+        }
+        let off = at(v);
+        let mut t = [0u64; 6];
+        for ((a, fine), h) in alloc.iter().zip(off.fsnr).zip(here.iter_mut()) {
+            *h = channel(a, snr_offset(off.csnr, fine));
+            t = sum(&t, h);
+        }
+        let ok = fits(&t, budget);
+        if ok {
+            *keep = here;
+        }
+        ok
+    };
     // lo holds, hi does not (1024 is past the last offset)
     let (mut lo, mut hi) = (0u32, 1024u32);
-    let start = (*hint).min(1023);
+    let start = hint.min(1023);
     let mut step = 1;
-    if holds(start) {
+    if holds(start, &mut best) {
         lo = start;
         while lo + step < hi {
-            if !holds(lo + step) {
+            if !holds(lo + step, &mut best) {
                 hi = lo + step;
                 break;
             }
@@ -187,7 +215,7 @@ pub(crate) fn tune(
     } else {
         hi = start;
         while hi > step {
-            if holds(hi - step) {
+            if holds(hi - step, &mut best) {
                 lo = hi - step;
                 break;
             }
@@ -197,17 +225,42 @@ pub(crate) fn tune(
     }
     while hi - lo > 1 {
         let mid = (lo + hi) / 2;
-        if holds(mid) {
+        if holds(mid, &mut best) {
             lo = mid;
         } else {
             hi = mid;
         }
     }
-    *hint = lo;
-    let mut off = at(lo);
-    if lo == 0 || shared {
-        return Some(off);
+    if lo == 0 {
+        best = [[0; 6]; MAX_SLOTS];
     }
+    Some((lo, best))
+}
+
+/// The offsets the frame is coded with: the largest `16·csnroffst + fsnroffst` shared by
+/// every slot (`search`); then, unless the fine offset is `shared`, from `GIVE` steps under
+/// it, one more fine step at a time for the slot whose step costs fewest bits, while the
+/// frame holds it. `hint` is the last frame's shared value, set to this one's. `None` if
+/// not even silence fits.
+pub(crate) fn tune(
+    alloc: &[Alloc],
+    budget: &Budget,
+    hint: &mut u32,
+    shared: bool,
+) -> Option<Offsets> {
+    let (lo, _) = search(alloc, budget, *hint)?;
+    *hint = lo;
+    if lo == 0 || shared {
+        return Some(at(lo));
+    }
+    Some(spread(alloc, budget, lo))
+}
+
+/// The per-slot climb from the shared `lo`: every slot `GIVE` fine steps under it, then one
+/// more step at a time for the slot whose step costs fewest bits, while the frame holds it.
+fn spread(alloc: &[Alloc], budget: &Budget, lo: u32) -> Offsets {
+    let slots = alloc.len().min(MAX_SLOTS);
+    let mut off = at(lo);
     let offset = |fine: u8| snr_offset(off.csnr, fine);
     let mut own = [[0u64; 6]; MAX_SLOTS];
     let mut next = [None; MAX_SLOTS];
@@ -244,7 +297,103 @@ pub(crate) fn tune(
         off.fsnr[c] += 1;
         next[c] = (off.fsnr[c] < 15).then(|| climb(&alloc[c], offset(off.fsnr[c]), &own[c]));
     }
-    Some(off)
+    off
+}
+
+/// The fast gain code a step of E-AC-3's climb moves a block to.
+const RAISED: u8 = FGAINCOD + 1;
+
+/// Fine steps times blocks of headroom a block at `RAISED` takes: a slot whose fine offset
+/// sits `k` under 15 may raise `k·blocks / CAP` blocks. 16 holds the LFE within 0.2 dB of
+/// AC-3's per-slot climb on the probe signal at 320 to 640 kbit/s.
+const CAP: usize = 16;
+
+/// E-AC-3's fill, the per-slot climb's counterpart for slots that share one fine offset:
+/// the bits the shared search at `lo` leaves, where each slot's tally is `own`, go one
+/// block of one slot at a time to fast gain code `RAISED`, the step that costs fewest bits
+/// first, its codes included, while the frame holds it and the slot is under its `CAP`.
+/// No slot gives bits up. `after` is set when block 0 sends codes whatever it raises, and
+/// `budget` holds those. Each slot's code per block, or `None` when nothing fits.
+pub(crate) fn gains(
+    alloc: &[Alloc],
+    budget: &Budget,
+    lo: u32,
+    own: &[Tally; MAX_SLOTS],
+    after: bool,
+) -> Option<[[u8; 6]; MAX_SLOTS]> {
+    let slots = alloc.len().min(MAX_SLOTS);
+    let n = alloc.first()?.blocks.min(6);
+    if lo == 0 || budget.first.is_some() {
+        return None;
+    }
+    let cap = (15 - (lo & 15) as usize) * n / CAP;
+    let offset = snr_offset((lo >> 4) as u8, (lo & 15) as u8);
+    // what each slot's block costs raised, packed
+    let mut raise = [[0u64; 6]; MAX_SLOTS];
+    for (a, r) in alloc.iter().zip(raise.iter_mut()) {
+        for s in 0..n {
+            if a.set[s] != s {
+                continue;
+            }
+            let mut mask = [0i16; 50];
+            masking(&a.bndpsd[s], a.start, a.end, RAISED, &mut mask);
+            let up = set_cost(&a.psd[s], &mask, a.start, a.end, offset);
+            for (b, r) in r.iter_mut().enumerate().take(n).skip(s) {
+                if a.set[b] == s {
+                    *r = up;
+                }
+            }
+        }
+    }
+    let mut gain = [[FGAINCOD; 6]; MAX_SLOTS];
+    let mut count = [0usize; MAX_SLOTS];
+    let mut mant = [0u64; 6];
+    for t in &own[..slots] {
+        mant = sum(&mant, t);
+    }
+    // a block sends codes once it or the one before is raised, block 0 also when `after`;
+    // a frame that sends any has a flag in every block
+    let mut raised = [false; 6];
+    let sends =
+        |raised: &[bool; 6], b: usize| raised[b] || (b == 0 && after) || (b > 0 && raised[b - 1]);
+    let codes = |raised: &[bool; 6]| -> u32 {
+        let sent = (0..n).filter(|b| sends(raised, *b)).count() as u32;
+        if sent == 0 {
+            0
+        } else {
+            n as u32 + 3 * slots as u32 * sent
+        }
+    };
+    let mut used = budget.header + budget.side.iter().sum::<u32>() + budget.trailer + bits(&mant);
+    // the budget holds the codes the frame sends unraised
+    used = used.saturating_sub(codes(&raised));
+    loop {
+        let base = used + codes(&raised);
+        let mut best: Option<(u32, usize, usize)> = None;
+        for b in 0..n {
+            let mut with = raised;
+            with[b] = true;
+            let extra = codes(&with) - codes(&raised);
+            let here = block_bits(mant[b]);
+            for c in 0..slots {
+                if gain[c][b] != FGAINCOD || count[c] >= cap {
+                    continue;
+                }
+                let up = block_bits(mant[b] - own[c][b] + raise[c][b]);
+                let total = base + extra + up - here;
+                if total <= budget.frame && best.is_none_or(|(t, ..)| total < t) {
+                    best = Some((total, c, b));
+                }
+            }
+        }
+        let Some((_, c, b)) = best else { break };
+        let here = block_bits(mant[b]);
+        mant[b] = mant[b] - own[c][b] + raise[c][b];
+        used = used + block_bits(mant[b]) - here;
+        (gain[c][b], raised[b]) = (RAISED, true);
+        count[c] += 1;
+    }
+    count.iter().any(|k| *k > 0).then_some(gain)
 }
 
 /// Mantissa bits of each block at `off`.
@@ -273,7 +422,7 @@ pub(crate) fn fill(alloc: &mut [Alloc], off: &Offsets) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bitalloc::curve;
+    use crate::bitalloc::Gains;
 
     fn channel_at(start: usize, end: usize, level: u8, sets: [usize; 6]) -> Alloc {
         let mut a = Alloc::new(start, end, 6);
@@ -282,7 +431,7 @@ mod tests {
             for (i, e) in a.exp[s].iter_mut().enumerate() {
                 *e = (level + (i % 9) as u8 / 3 + s as u8).min(24);
             }
-            curve(&a.exp[s], start, end, &mut a.psd[s], &mut a.mask[s]);
+            a.analyse(s);
         }
         a
     }
@@ -369,6 +518,41 @@ mod tests {
         }
     }
 
+    /// The E-AC-3 fill raises only what the shared offsets leave room for, codes included,
+    /// and the regrouped sets tally what it priced.
+    #[test]
+    fn the_fill_spends_only_what_the_search_leaves() {
+        let mut raised = 0;
+        for frame in (6000u32..30000).step_by(1500) {
+            let mut alloc = [
+                channel_at(0, 181, 3, [0, 0, 0, 3, 3, 3]),
+                channel_at(0, 7, 2, [0, 0, 0, 0, 0, 0]),
+                channel_at(181, 253, 4, [0, 1, 1, 1, 4, 4]),
+            ];
+            let budget = Budget {
+                header: 120,
+                side: [900, 40, 200, 300, 250, 40],
+                trailer: 18,
+                frame,
+                first: None,
+            };
+            let (lo, own) = search(&alloc, &budget, 300).unwrap();
+            let Some(gain) = gains(&alloc, &budget, lo, &own, false) else {
+                continue;
+            };
+            for (a, g) in alloc.iter_mut().zip(&gain) {
+                a.regroup(g);
+            }
+            let codes = Gains::of(&gain[..3], 6, false).unwrap();
+            let sent = codes.sent.iter().filter(|s| **s).count() as u32;
+            let t = tally(&alloc, &at(lo));
+            let used = budget.header + budget.side.iter().sum::<u32>() + budget.trailer;
+            assert!(used + bits(&t) + 6 + 9 * sent <= frame, "frame {frame}");
+            raised += 1;
+        }
+        assert!(raised > 4, "{raised}");
+    }
+
     #[test]
     fn fill_writes_what_the_tally_counted() {
         let mut alloc = [
@@ -379,6 +563,7 @@ mod tests {
         let off = Offsets {
             csnr: 20,
             fsnr: [5, 9, 3, 0, 0, 0, 0],
+            gains: None,
         };
         let want = tally(&alloc, &off);
         fill(&mut alloc, &off);

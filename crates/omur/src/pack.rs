@@ -289,7 +289,7 @@ pub(crate) fn block_side(
         w.put(u32::from(DBPBCOD), 2)?;
         w.put(u32::from(FLOORCOD), 3)?;
     }
-    // E-AC-3 carries the offsets in audfrm (`snroffststr` 0), the fast gain codes at 4
+    // E-AC-3 carries the offsets in audfrm (`snroffststr` 0), the fast gain codes after
     if !e {
         w.put(u32::from(first), 1)?; // snroffste
         if first {
@@ -305,6 +305,17 @@ pub(crate) fn block_side(
             if let Some(l) = s.lfe_slot() {
                 w.put(u32::from(off.fsnr[l]), 4)?;
                 w.put(u32::from(FGAINCOD), 3)?;
+            }
+        }
+    }
+    if let (true, Some(g)) = (e, off.gains) {
+        let sent = g.sent.get(blk).copied().unwrap_or(false);
+        w.put(u32::from(sent), 1)?; // fgaincode
+        if let (true, Some(codes)) = (sent, g.codes.get(blk)) {
+            // cplfgaincod, fgaincod per channel, lfefgaincod
+            let cs = cpl.map(|(_, cs, _)| cs);
+            for c in cs.into_iter().chain(0..fbw.len()).chain(s.lfe_slot()) {
+                w.put(u32::from(codes.get(c).copied().unwrap_or(FGAINCOD)), 3)?;
             }
         }
     }

@@ -80,7 +80,7 @@ pub(crate) fn header(
     }
     w.put(0, 2)?; // snroffststr: the frame's offsets, in audfrm
     // transproce, blkswe, dithflage, bamode, frmfgaincode, dbaflde, skipflde, spxattene
-    w.put(0b0111_0010, 8)?;
+    w.put(0b0111_0010 | u32::from(off.gains.is_some()) << 3, 8)?;
     let fbw = &side[..s.nfchans.min(side.len())];
     let cpl = s.cpl_slot().and_then(|c| side.get(c));
     if s.acmod > 1 {

@@ -5,7 +5,7 @@
 pub(crate) mod coupling;
 mod transient;
 
-use crate::bitalloc::{Alloc, MAX_SLOTS, Offsets, curve};
+use crate::bitalloc::{Alloc, FGAINCOD, Gains, MAX_SLOTS, Offsets};
 use crate::bits::{BitWriter, Overflow};
 use crate::exponents::{D15, D45, Groups, REUSE, encode, extract, group_count, plan};
 use crate::mantissas::Mantissas;
@@ -87,13 +87,7 @@ fn envelope(
             &mut side.groups[b],
             &mut alloc.exp[b],
         );
-        curve(
-            &alloc.exp[b],
-            start,
-            end,
-            &mut alloc.psd[b],
-            &mut alloc.mask[b],
-        );
+        alloc.analyse(b);
         alloc.set[b..b + len].fill(b);
         b += len;
     }
@@ -205,6 +199,9 @@ pub(crate) struct Ac3 {
     remat: [bool; 4],
     /// Where the last frame's shared offset search ended, where the next one starts.
     hint: u32,
+    /// The last frame's last block sent fast gain codes other than `FGAINCOD`, which the
+    /// next frame's block 0 must reset for ffmpeg; E-AC-3 only.
+    after: bool,
     /// Blocks from the start of the six-block group to this frame's first.
     group: usize,
     /// What the next frame carries in its skip fields, `ext_len` bytes of it, spread over
@@ -276,6 +273,7 @@ impl Ac3 {
             coupling: cpl.map(|b| Box::new(coupling::Frame::new(b))),
             remat: [false; 4],
             hint: 0,
+            after: false,
             group: 0,
             ext: vec![0; if eac3 { SKIP_BYTES * blocks } else { 0 }].into_boxed_slice(),
             ext_len: 0,
@@ -311,7 +309,11 @@ impl Ac3 {
             f.send = [[true; coupling::MAX_FBW]; 6];
         }
         let mut scratch = vec![0u8; self.stream.frame_bytes];
-        let Ok(budget) = self.size(&mut scratch) else {
+        let all = Gains {
+            codes: [[FGAINCOD; MAX_SLOTS]; 6],
+            sent: [true; 6],
+        };
+        let Ok(budget) = self.size(&mut scratch, Some(all)) else {
             return 0;
         };
         let used = budget.header + budget.side.iter().sum::<u32>() + budget.trailer + 9 * n as u32;
@@ -361,19 +363,55 @@ impl Ac3 {
     /// instead: every `bap` 0, no mantissas, which every rate holds.
     pub(crate) fn encode(&mut self, out: &mut [u8]) {
         self.analyse();
-        if let Ok(budget) = self.size(out) {
-            let shared = self.stream.eac3();
-            let tuned = tuner::tune(&self.alloc, &budget, &mut self.hint, shared);
-            let written = tuned.map(|off| self.write(out, &budget, &off));
-            if !matches!(written, Some(Ok(()))) {
-                let _ = self.write(out, &budget, &Offsets::default());
-                #[cfg(test)]
-                {
-                    self.fallbacks += 1;
+        let eac3 = self.stream.eac3();
+        let (n, slots) = (self.stream.blocks, self.alloc.len().min(MAX_SLOTS));
+        let flat = [[FGAINCOD; 6]; MAX_SLOTS];
+        let base = Gains::of(&flat[..slots], n, self.after).filter(|_| eac3);
+        if let Ok(mut budget) = self.size(out, base) {
+            let tuned = if eac3 {
+                self.shared(out, &mut budget, base)
+            } else {
+                tuner::tune(&self.alloc, &budget, &mut self.hint, false)
+            };
+            let written = tuned.map(|off| (self.write(out, &budget, &off), off));
+            match written {
+                Some((Ok(()), off)) => self.after = Gains::last_differs(off.gains.as_ref(), n),
+                _ => {
+                    let _ = self.write(out, &budget, &Offsets::default());
+                    #[cfg(test)]
+                    {
+                        self.fallbacks += 1;
+                    }
                 }
             }
         }
         self.ext_len = 0;
+    }
+
+    /// E-AC-3's offsets: the shared search, then the fast gain codes the bits it leaves
+    /// buy (`tuner::gains`), with `budget` resized for them. `base` is the codes the frame
+    /// sends whatever it raises.
+    fn shared(
+        &mut self,
+        out: &mut [u8],
+        budget: &mut Budget,
+        base: Option<Gains>,
+    ) -> Option<Offsets> {
+        let (lo, own) = tuner::search(&self.alloc, budget, self.hint)?;
+        self.hint = lo;
+        let mut off = Offsets {
+            gains: base,
+            ..tuner::at(lo)
+        };
+        if let Some(gain) = tuner::gains(&self.alloc, budget, lo, &own, self.after) {
+            let (n, slots) = (self.stream.blocks, self.alloc.len().min(MAX_SLOTS));
+            for (a, g) in self.alloc.iter_mut().zip(&gain) {
+                a.regroup(g);
+            }
+            off.gains = Gains::of(&gain[..slots], n, self.after);
+            *budget = self.size(out, off.gains).ok()?;
+        }
+        Some(off)
     }
 
     /// Everything up to the SNR offsets: transforms, the coupling channel, exponents and
@@ -435,7 +473,7 @@ impl Ac3 {
 
     /// Where the mantissas must fit. Side information does not depend on the offsets'
     /// values: a dry run into `out` sizes it.
-    fn size(&self, out: &mut [u8]) -> Result<Budget, Overflow> {
+    fn size(&self, out: &mut [u8], gains: Option<Gains>) -> Result<Budget, Overflow> {
         let s = &self.stream;
         let choices = Choices {
             cpl: self.coupling.as_deref(),
@@ -449,12 +487,15 @@ impl Ac3 {
             first: s.five_eighths(),
         };
         let mut w = BitWriter::new(out);
-        self.header(&mut w, &Offsets::default())?;
+        let off = Offsets {
+            gains,
+            ..Offsets::default()
+        };
+        self.header(&mut w, &off)?;
         budget.header = w.position() as u32;
         let ext = &self.ext[..self.ext_len];
         for b in 0..s.blocks {
             let at = w.position();
-            let off = Offsets::default();
             pack::block_side(&mut w, s, &self.side, choices, &off, b, skip_of(ext, b))?;
             budget.side[b] = (w.position() - at) as u32;
         }
@@ -616,7 +657,7 @@ mod tests {
             }
             enc.analyse();
             let what = format!("{config:?}");
-            let budget = enc.size(&mut out).expect(&what);
+            let budget = enc.size(&mut out, None).expect(&what);
             assert!(
                 tuner::tune(&enc.alloc, &budget, &mut 0, false).is_some(),
                 "{what}"

@@ -44,8 +44,11 @@ fn snr_db(want: &[f32], got: &[f32]) -> f64 {
     10.0 * (s / e).log10()
 }
 
+/// Every frame's header fields, and the audio through oxideav; fast gain codes, which
+/// the leftover bits buy, decode with the rest.
 #[test]
 fn every_length_and_rate_decodes_with_its_header() {
+    let mut gains = 0;
     for layout in [Layout::Stereo, Layout::Surround51] {
         // per channel in bitstream order, the floor at the lowest rate and one block; Rs is
         // the noise channel, whose top a coupled stream loses
@@ -90,8 +93,9 @@ fn every_length_and_rate_decodes_with_its_header() {
                     let a = audfrm::parse_with(&mut br, &b).unwrap();
                     let flags = (a.expstre, a.ahte, a.snroffststr, a.transproce, a.blkswe);
                     assert_eq!(flags, (true, false, 0, false, true), "{what}");
-                    let flags = (a.dithflage, a.bamode, a.frmfgaincode, a.dbaflde);
-                    assert_eq!(flags, (true, true, false, false), "{what}");
+                    let flags = (a.dithflage, a.bamode, a.dbaflde);
+                    assert_eq!(flags, (true, true, false), "{what}");
+                    gains += usize::from(a.frmfgaincode);
                     assert_eq!((a.skipflde, a.spxattene), (true, false), "{what}");
                 }
                 let decoded = decode(&frames, wav.len());
@@ -108,6 +112,7 @@ fn every_length_and_rate_decodes_with_its_header() {
             }
         }
     }
+    assert!(gains > 0, "no frame sent fast gain codes");
 }
 
 /// The bytes `set_extension` hands over come back, in order, from the skip fields of the
