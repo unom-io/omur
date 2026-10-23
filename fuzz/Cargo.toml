@@ -13,7 +13,8 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 arbitrary = "1"
-omur = { path = "../crates/omur" }
+# `objects` drives the object-audio encoder, behind its off-by-default feature.
+omur = { path = "../crates/omur", features = ["joc"] }
 oxideav-ac3 = "=0.0.11"
 oxideav-core = "=0.1.41"
 
@@ -34,6 +35,13 @@ bench = false
 [[bin]]
 name = "api"
 path = "fuzz_targets/api.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "objects"
+path = "fuzz_targets/objects.rs"
 test = false
 doc = false
 bench = false
