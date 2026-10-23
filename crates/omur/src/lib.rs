@@ -17,9 +17,7 @@
 //!
 //! Object audio (ETSI TS 103 420) is the [`joc`] module, behind the `joc` feature.
 //!
-//! Status: design, in `docs/design.md`. Nothing encodes yet.
-
-#![allow(dead_code)]
+//! Status: AC-3 2.0 and 5.1, no coupling or block switching yet; E-AC-3 is P2 (`docs/design.md`).
 
 mod ac3;
 mod bitalloc;
@@ -208,11 +206,45 @@ pub struct Frame<'a> {
 /// no lock, spawn nothing, allocate nothing and never panic.
 pub struct Encoder {
     config: Config,
+    core: ac3::Ac3,
+    /// For each coded channel, in bitstream order, its slot in a WAV-order sample.
+    wav_slot: &'static [usize],
+    /// Samples of the current frame's span that have arrived.
+    fill: usize,
+    /// Index of the current frame's first sample.
+    pts: u64,
+    out: Box<[u8]>,
+    out_pts: u64,
+    ready: bool,
+    syncframes: [Range<usize>; 1],
 }
 
 impl Encoder {
+    /// Panics on [`Codec::Eac3`]: E-AC-3 is P2 (docs/design.md §11).
     pub fn new(config: Config) -> Result<Encoder, Error> {
-        Ok(Encoder { config })
+        if let Codec::Eac3 { .. } = config.codec {
+            todo!("P2, docs/design.md §11")
+        }
+        let core = ac3::Ac3::new(config.layout, config.bitrate_kbps);
+        let bytes = core.frame_bytes();
+        Ok(Encoder {
+            config,
+            core,
+            wav_slot: match config.layout {
+                Layout::Stereo => &[0, 1],
+                // L C R Ls Rs LFE from FL FR FC LFE BL BR
+                _ => &[0, 2, 1, 4, 5, 3],
+            },
+            fill: 0,
+            pts: 0,
+            out: vec![0; bytes].into_boxed_slice(),
+            out_pts: 0,
+            ready: false,
+            syncframes: [Range {
+                start: 0,
+                end: bytes,
+            }],
+        })
     }
 
     pub fn config(&self) -> Config {
@@ -221,17 +253,55 @@ impl Encoder {
 
     /// Queue interleaved f32 in WAV order, any chunk length. Non-finite samples read as
     /// silence. A frame is encoded as soon as [`Config::delay_samples`] have arrived past
-    /// its start.
+    /// its start. [`Error::Backlog`] refuses, and consumes nothing of, a push that would
+    /// complete a frame while the last one is unread — or complete two.
     pub fn push(&mut self, pcm: &[f32]) -> Result<(), Error> {
-        if !pcm.len().is_multiple_of(self.config.layout.channels()) {
+        let channels = self.config.layout.channels();
+        if !pcm.len().is_multiple_of(channels) {
             return Err(Error::Length);
         }
-        todo!("P1, docs/design.md §11")
+        let n = pcm.len() / channels;
+        let need = ac3::SPAN - self.fill;
+        if n >= need && (self.ready || n - need >= self.config.frame_samples()) {
+            return Err(Error::Backlog);
+        }
+        let mut samples = pcm.chunks_exact(channels);
+        let mut left = n;
+        while left > 0 {
+            let take = left.min(ac3::SPAN - self.fill);
+            let span = self.core.pcm_mut();
+            for (j, sample) in samples.by_ref().take(take).enumerate() {
+                for (dst, slot) in span.iter_mut().zip(self.wav_slot) {
+                    let v = sample.get(*slot).copied().unwrap_or(0.0);
+                    if let Some(d) = dst.get_mut(self.fill + j) {
+                        *d = if v.is_finite() { v } else { 0.0 };
+                    }
+                }
+            }
+            self.fill += take;
+            left -= take;
+            if self.fill == ac3::SPAN {
+                self.ready = self.core.encode(&mut self.out).is_ok();
+                self.out_pts = self.pts;
+                self.pts += self.config.frame_samples() as u64;
+                self.core.advance();
+                self.fill = BLOCK_SAMPLES;
+            }
+        }
+        Ok(())
     }
 
     /// The frame the last `push` completed, once.
     pub fn pull(&mut self) -> Option<Frame<'_>> {
-        todo!("P1, docs/design.md §11")
+        if !self.ready {
+            return None;
+        }
+        self.ready = false;
+        Some(Frame {
+            bytes: &self.out,
+            syncframes: &self.syncframes,
+            pts: self.out_pts,
+        })
     }
 }
 

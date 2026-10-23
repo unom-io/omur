@@ -7,9 +7,9 @@ behind the `joc` feature, off by default.
 
 *ómur* is Icelandic for an echo, a faint or distant sound.
 
-**Status: design.** Nothing encodes yet. The design — scope, modules, the bit-allocation
-plan, the test gates, the phases — is [`docs/design.md`](docs/design.md). The public API is
-in place and the size and delay queries are live; `push`/`pull` land in P1.
+**Status: P1 in progress.** AC-3 2.0 and 5.1 encode, without channel coupling or block
+switching yet; E-AC-3 and object audio do not. The design — scope, modules, the
+bit-allocation plan, the test gates, the phases — is [`docs/design.md`](docs/design.md).
 
 ```rust
 use omur::{Codec, Config, Encoder, Layout};
