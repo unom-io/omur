@@ -150,15 +150,22 @@ pub fn encode(config: Config, pcm: &[f32], chunk: usize) -> Vec<(u64, Vec<u8>)> 
 }
 
 /// ffmpeg, where it is on `PATH`, decodes `stream` without a message. `name` ends in the
-/// stream's extension. `OMUR_STREAMS=<dir>` keeps a copy of every stream there.
+/// stream's extension, `.ac3` or `.ec3`, which names the demuxer: a receiver knows what it
+/// is handed, and ffmpeg 6.1's probe scores a five-frame raw file level with H.263.
+/// `OMUR_STREAMS=<dir>` keeps a copy of every stream there.
 pub fn ffmpeg_decodes(stream: &[u8], name: &str) {
     let path = std::env::temp_dir().join(format!("omur-{}-{name}", std::process::id()));
     std::fs::write(&path, stream).unwrap();
     if let Ok(dir) = std::env::var("OMUR_STREAMS") {
         let _ = std::fs::write(std::path::Path::new(&dir).join(name), stream);
     }
+    let demuxer = if name.ends_with(".ec3") {
+        "eac3"
+    } else {
+        "ac3"
+    };
     let out = std::process::Command::new("ffmpeg")
-        .args(["-v", "error", "-i"])
+        .args(["-v", "error", "-f", demuxer, "-i"])
         .arg(&path)
         .args(["-f", "null", "-"])
         .output();
