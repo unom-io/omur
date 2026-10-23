@@ -4,9 +4,11 @@
 //! tally — packed `bap` costs per block, priced by the grouping rule — never a `bap` array;
 //! only the winner's arrays are written (docs/design.md §5).
 
-use crate::bitalloc::{Alloc, MAX_SLOTS, Offsets, for_each_address, for_each_bap, snr_offset};
+use crate::bitalloc::{
+    Alloc, FLOORCOD, MAX_END, MAX_SLOTS, Offsets, for_each_address, for_each_bap, snr_offset,
+};
 use crate::mantissas::{PACKED, block_bits};
-use crate::tables::BAPTAB;
+use crate::tables::{BAPTAB, BNDSZ, BNDTAB, FLOORTAB, MASKTAB};
 
 /// Where the mantissas must fit: every other bit of the frame, counted by a dry run.
 pub(crate) struct Budget {
@@ -57,6 +59,50 @@ fn channel(a: &Alloc, offset: i32) -> Tally {
         }
     }
     t
+}
+
+/// Channel `a`'s tally one fine step up from `offset`, from `t`, its tally at `offset`: a
+/// band's masking value moves once in eight steps, so only the bands it moves in are priced
+/// again.
+fn climb(a: &Alloc, offset: i32, t: &Tally) -> Tally {
+    let end = a.end.min(MAX_END);
+    let mut out = *t;
+    if a.start >= end {
+        return out;
+    }
+    let floor = FLOORTAB[FLOORCOD as usize];
+    let bands = MASKTAB[a.start] as usize..MASKTAB[end - 1] as usize + 1;
+    for s in 0..a.blocks {
+        if a.set[s] != s {
+            continue;
+        }
+        let (mut add, mut sub) = (0u64, 0u64);
+        for (band, mk) in a.mask[s]
+            .iter()
+            .enumerate()
+            .take(bands.end)
+            .skip(bands.start)
+        {
+            let m = |o: i32| ((i32::from(*mk) - o - floor).max(0) & 0x1fe0) + floor;
+            let (old, new) = (m(offset), m(offset + 4));
+            if old == new {
+                continue;
+            }
+            let lo = usize::from(BNDTAB[band]).max(a.start);
+            let hi = (usize::from(BNDTAB[band]) + usize::from(BNDSZ[band])).min(end);
+            let cost = |p: i32, m: i32| BY_ADDRESS[((p - m) >> 5).clamp(0, 63) as usize];
+            for p in a.psd[s].get(lo..hi).unwrap_or_default() {
+                add += cost(i32::from(*p), new);
+                sub += cost(i32::from(*p), old);
+            }
+        }
+        for (blk, t) in out.iter_mut().enumerate().take(a.blocks).skip(s) {
+            if a.set[blk] == s {
+                *t = t.wrapping_add(add).wrapping_sub(sub);
+            }
+        }
+    }
+    out
 }
 
 fn sum(a: &Tally, b: &Tally) -> Tally {
@@ -176,7 +222,7 @@ pub(crate) fn tune(
         for (c, a) in alloc.iter().enumerate().take(slots) {
             own[c] = channel(a, offset(off.fsnr[c]));
             total = sum(&total, &own[c]);
-            next[c] = (off.fsnr[c] < 15).then(|| channel(a, offset(off.fsnr[c] + 1)));
+            next[c] = (off.fsnr[c] < 15).then(|| climb(a, offset(off.fsnr[c]), &own[c]));
         }
         if fits(&total, budget) {
             break;
@@ -196,7 +242,7 @@ pub(crate) fn tune(
         total = t;
         own[c] = next[c].unwrap_or(own[c]);
         off.fsnr[c] += 1;
-        next[c] = (off.fsnr[c] < 15).then(|| channel(&alloc[c], offset(off.fsnr[c] + 1)));
+        next[c] = (off.fsnr[c] < 15).then(|| climb(&alloc[c], offset(off.fsnr[c]), &own[c]));
     }
     Some(off)
 }
@@ -302,6 +348,24 @@ mod tests {
             let t = channel(&a, snr_offset(15, 0));
             assert!(t[..blocks].iter().all(|v| *v > 0), "{blocks}: {t:?}");
             assert!(t[blocks..].iter().all(|v| *v == 0), "{blocks}: {t:?}");
+        }
+    }
+
+    /// A climb prices exactly what a fresh tally one fine step up does.
+    #[test]
+    fn a_climb_is_the_next_offsets_tally() {
+        let alloc = [
+            channel_at(0, 253, 3, [0, 0, 0, 3, 3, 3]),
+            channel_at(0, 7, 2, [0, 0, 2, 2, 2, 2]),
+            channel_at(133, 217, 4, [0, 1, 2, 3, 4, 5]),
+            channel_at(145, 253, 1, [0, 0, 0, 0, 0, 0]),
+        ];
+        for a in &alloc {
+            for v in 0..1023 {
+                let at = |v: i32| snr_offset((v >> 4) as u8, (v & 15) as u8);
+                let here = channel(a, at(v));
+                assert_eq!(climb(a, at(v), &here), channel(a, at(v + 1)), "{v}");
+            }
         }
     }
 
