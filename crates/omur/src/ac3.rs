@@ -72,8 +72,9 @@ fn envelope(
             .take_while(|st| **st == REUSE)
             .count();
         let mut env = raw[b];
+        let bins = start.min(end)..end.min(256);
         for r in &raw[b + 1..b + len] {
-            for (e, v) in env.iter_mut().zip(r).take(end).skip(start) {
+            for (e, v) in env[bins.clone()].iter_mut().zip(&r[bins.clone()]) {
                 *e = (*e).min(*v);
             }
         }
