@@ -370,9 +370,8 @@ pub(crate) fn mantissas(
             break;
         };
         // a bin without bits puts nothing: no branch to mispredict on bap 0
-        for (v, n) in code.iter().zip(bits).take(s.end).skip(s.start) {
-            w.put(u32::from(*v), u32::from(*n))?;
-        }
+        let bins = s.start.min(s.end)..s.end.min(256);
+        w.put_all(&code[bins.clone()], &bits[bins])?;
     }
     Ok(())
 }
