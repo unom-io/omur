@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Design — nothing implemented |
+| **Status** | Built 2026-10-23: P1–P3 on `main`, measured in the README; the listening pass, the receiver checks and P4 are owed (§14) |
 | **Date** | 2026-10-23 |
 | **Name** | Icelandic *ómur*: an echo, a faint or distant sound; from *óma*, "to resound". Alternatives: *hljómur* (sound, tone, chord) and *dynur* (din, rumble). None is a trademark; `omur`, `hljomur` and `dynur` are free on crates.io. |
 | **One line** | An AC-3 and E-AC-3 encoder (ATSC A/52:2018) in safe Rust for a real-time audio thread: interleaved f32 in, whole syncframes out, nothing allocated after construction. Object audio (ETSI TS 103 420) inside the crate, behind an off-by-default feature and a release gate. |
@@ -26,7 +26,7 @@ makes it easy.
 | D5 | Speed without `unsafe` | **One thread, no intrinsics, fixed-size arrays the compiler vectorises.** Target ≥ 100× real time for 5.1 on one core (a host needs 1×; the vuio fork reaches 215× the same way). rayon is not an option on an audio thread. |
 | D6 | Where the bits go | **Masking curve once per channel-block per frame, a bit tally per candidate offset, a coarse frame-wide search followed by per-channel fine offsets.** The per-channel step targets the measured imbalance of the references (FL over-served, FR and LFE starved). §5. |
 | D7 | Coupling | **On for every layout, start band by bitrate**, chosen against the ffmpeg stream's own decisions as read by `probe dump` (its bitstream is data, not source). §5.6. |
-| D8 | Block switching | **Implemented from the start**, driven by the §8.2.2 transient detector; the P1 listening pass decides whether it stays on by default. ffmpeg never uses it, and a waveform SNR on bursts cannot judge it. §6. |
+| D8 | Block switching | **Implemented from the start**, driven by the §8.2.2 transient detector, on by default; the listening pass may still turn it off. Measured: the burst channels' SNR does not move either way. ffmpeg never uses it, and a waveform SNR on bursts cannot judge it. §6. |
 | D9 | 7.1 on E-AC-3 | **Independent substream = 5.1 with the surrounds folded; dependent substream = four channels (Ls, Rs replaced; Lrs, Rrs added).** A 5.1-only decoder plays the independent substream alone and hears everything. Verified in P2 by ffmpeg's replace-or-extend decode. §7.3. |
 | D10 | E-AC-3 tools | **None of SPX, AHT, enhanced coupling or TPNP.** The quality comes from the AC-3 core; the E-AC-3 features we need are `bsid` 16, the 1/2/3/6-block frame lengths and the substream pair. The tools can come later behind the same tests. |
 | D11 | Object audio | **Inside the crate behind the `joc` feature, off by default; dynamic objects designed and built in full, not only beds.** The feature keeps the module out of every default build and out of punktfunk until the gate clears; because a published crate ships every source file, no tag that contains the module is published before the answer (§12). Wine delivers beds and no objects today; the object path is built against synthetic scenes so the host changes one call when Proton catches up. §8. |
@@ -279,8 +279,10 @@ coordinates (`cplco`), which is the single largest saving in 5.1. Decisions: cou
 every layout; the start band (`cplbegf`, bins `37 + 12·cplbegf` at 93.75 Hz per bin, so
 `cplbegf = 8` is 12.5 kHz, not the 6 kHz a reference comment claims — read code, not
 comments) chosen per bitrate from a small table; coordinates re-sent when any band's
-coordinate moves by more than a step; phase flags off; the centre included. The initial
-table is taken from what ffmpeg's streams do at each rate, then tuned against the gate.
+coordinate moves by more than 3 dB (one step resent in nearly every block and cost FL
+0.5 dB); phase flags per band in 2/0 when the cross-spectrum says L + R cancels (an
+anti-phase 15 kHz tone: 3 dB without them, 63 dB with); the centre included. The table is
+what ffmpeg's streams do at each rate, read by `probe dump`.
 
 ## 6. Transients and block switching
 
@@ -320,7 +322,14 @@ also the **MTU** option: 640 kbps at three blocks and 1,024 kbps at two blocks b
 1,400-byte datagram that AC-3 at 384 kbps does not. The cost is header and, above all,
 exponents: block 0 of every syncframe sends them fresh, so a one-block stream has no reuse at
 all and may spend half its budget on envelopes. P2 measures the SNR cost of each length at
-448 and 640 kbps and reports the table; the expected sweet spot is two or three blocks.
+448 and 640 kbps and reports the table; measured (README), three blocks is the
+recommendation: 1,280 bytes at 640 kbps, about 1 dB on FR and the LFE.
+
+SNR offsets travel at frame level (`snroffststr` 0): ffmpeg 9.0.1 reads the per-block
+`snroffste` bit in block 0 and in no later block, the reverse of E.1.2.4, so the per-slot
+strategies decode wrongly in every ffmpeg-based player. The per-channel step AC-3 takes is
+made up with per-channel fast gain codes (`frmfgaincode`), which both decoders read; a block
+after a raised one resends its codes, because ffmpeg keeps them where the spec resets to 4.
 
 Rates: an E-AC-3 frame is whole words, so a rate rounds to the nearest word (at most
 1.5 kbit/s); `Config::frame_bytes` reports the rounded size. The ladder in `Config::bitrates`
@@ -340,8 +349,10 @@ The budget splits across I0 and D0 by coded channel count, rounded to words, eac
 ### 7.4 Compatibility
 
 Decoders are required to accept every `numblkscod`. Receivers that advertise E-AC-3 over
-ARC/eARC accept `bsid` 16 with dependent substreams; the on-glass check in P2 is the
-maintainer's AVR (a Denon AVC-X3800H sits on the LAN) reporting the input as 7.1.
+ARC/eARC accept `bsid` 16 with dependent substreams; ffmpeg decodes the pair to eight
+channels with identity mapping and the independent substream alone to the fold. The
+on-glass check is the maintainer's AVR (a Denon AVC-X3800H sits on the LAN) reporting the
+input as 7.1 — owed.
 
 ## 8. Object audio — feature `joc`
 
@@ -460,6 +471,20 @@ then `pull`; an object not pushed in a chunk is silent for it; `at_sample` is th
 within the chunk at which the update took effect. §4 holds unchanged: everything is allocated
 in `new`, sized by the bed and `objects`.
 
+What the spec settled when P3 was built, against the plan above:
+
+- Six-block frames only: clause 5.3.2 defines the frame offset against 1,536 samples, so
+  `ObjectConfig::blocks` must be `Six`.
+- A bed element sends no position: clause 5.5.9 places it by its label; BackCenter has no
+  label and goes out as an object at its fixed place.
+- One container per frame, in one skip field of at most 511 bytes; a scene that needs more
+  (sixteen moving elements at two data points) steps its elements down.
+- The element count excludes the LFE; a 7.1.4 bed is 11 elements, five objects fit beside it.
+- Up to eight timed updates per frame on a 32-sample grid, each ramping within the frame.
+- Sparse coding only for a one-band element; everything else dense, fine or coarse.
+- `codecdatae` follows TS 103 420 Table 56, where A/52 Annex H says 0: the receiver check
+  decides (§14).
+
 ### 8.5 Verification and gates
 
 - oxideav-ac3's opt-in JOC decoder reconstructs the elements and parses the OAMD: per-element
@@ -471,6 +496,10 @@ in `new`, sized by the bed and `objects`.
   stream.
 - On glass: the Denon reports the stream as object audio, the height speakers carry the height
   bed, and the circling object pans across the room.
+- Measured (README): bed channels 61 dB, heights 41 dB (the fine quantiser's error on the
+  −3 dB fold), moving pink-noise objects 25 dB — the core's own ceiling on pink noise; two
+  broadband objects panned to the same spot cannot be separated from a 5-channel core by
+  any matrix, so the scenes keep them apart.
 - Release gate: no tag that contains `src/joc` is published, and no punktfunk build enables
   `joc`, until the maintainer has an answer from counsel or from the rights holder on the
   active patent family (§12).
@@ -557,10 +586,10 @@ builds it on 1.96).
 | **P3 — object audio** | the `joc` module: element budget and fold, core renderer, QMF, matrix estimation, coarse/fine coding, OAMD with timed updates, EMDF, skip-field injection; beds and dynamic objects; `probe scene`; the 12-channel bed path end to end from a Wine game | a 7.1.4 bed and the synthetic scenes of §8.5 reconstructed by oxideav's JOC decoder with every element ≥ 20 dB SNR at 768 kbps, positions read back within one step, and the core within 1 dB of P2's 5.1; the 32-object scene folds without a click; a receiver on glass lights up object audio and drives height speakers; the counsel/rights-holder answer on file — **no tag with `src/joc` published before it** |
 | **P4 — crates.io** | README stating what works, measured numbers and the recommended rates; docs.rs clean; `cargo publish --dry-run`; MSRV job; a clean fuzz run; `v0.1.0` | `omur` published from a tag that either predates `src/joc` or follows the P3 answer; the probe not; punktfunk's integration task opened with the codec id and the ladder |
 
-Rough size: P1 is the bulk (tables ~1.5k lines, the pipeline ~3k, tests and the probe ~2k);
-P2 ~1.5k; P3 ~4k plus the host sink work it needs; P4 is paperwork. P1 and P2 are
-sequential; P3 starts once P2's skip-field hook exists; P4 waits for P2, and for P3 only
-if the tag contains it.
+Status 2026-10-23: P1, P2 and P3 are built on `main` and meet their numbers (README),
+except the listening pass and the receiver checks, which need the maintainer; P4 waits on
+those and on the patent answer, since `main` holds `src/joc`. P1 came to ~3.5k lines of
+library plus tests, P2 ~1.5k, P3 ~5k.
 
 ## 12. Credits, licences, patents
 
@@ -613,8 +642,13 @@ if the tag contains it.
    is safe on every receiver. Confirm, or accept 5.1 receivers losing the backs.
 6. **`dialnorm` −31 and no DRC** (D1): confirm that the host never needs loudness metadata.
 7. **Listening material and listeners** for P1's pass (§9.4): which hosts and games, and who
-   besides you.
+   besides you. It also decides two things the SNR cannot: whether block switching stays on
+   (D8), and whether per-channel fast gain (`fgaincod` 5–7 on tonal channels, worth
+   5–16 dB of waveform SNR on FL/FR/LFE) is adopted for AC-3 as it is for E-AC-3.
 8. **Who asks counsel**, and about what exactly: the object-coding family only, or E-AC-3
    outside the US as well, given where the host is distributed (Flathub, the App Stores).
 9. **The reference encoders in the probe**: keep oxideav and the vuio fork as permanent
-   baselines, or drop them once omur beats both?
+   baselines, or drop them now that omur beats both?
+10. **Receiver checks** on the Denon: 7.1 E-AC-3 shows as 7.1; a `probe scene` stream lights
+    up object audio and drives the height speakers; and whether it accepts `codecdatae` as
+    TS 103 420 writes it (§8.4).
