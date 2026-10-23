@@ -2,7 +2,7 @@
 //! tally — `bap` counts per block, priced by the grouping rule — never a `bap` array; only
 //! the winner's arrays are written (docs/design.md §5).
 
-use crate::bitalloc::{Alloc, Offsets, for_each_bap, snr_offset};
+use crate::bitalloc::{Alloc, MAX_SLOTS, Offsets, for_each_bap, snr_offset};
 use crate::mantissas::block_bits;
 
 /// Where the mantissas must fit: every other bit of the frame, counted by a dry run.
@@ -32,7 +32,7 @@ fn add(tally: &mut Tally, a: &Alloc, offset: i32) {
             continue;
         }
         let mut count = [0u32; 16];
-        for_each_bap(&a.psd[s], &a.mask[s], a.end, offset, |_, b| {
+        for_each_bap(&a.psd[s], &a.mask[s], a.start, a.end, offset, |_, b| {
             count[usize::from(b & 15)] += 1;
         });
         for (blk, t) in tally.iter_mut().enumerate() {
@@ -56,81 +56,76 @@ fn fits(tally: &Tally, budget: &Budget) -> bool {
 }
 
 /// Offsets all zero mean every `bap` is zero (§7.2.2.1).
-fn silent(off: Offsets, lfe: bool) -> bool {
-    off.csnr == 0 && off.fsnr == 0 && (!lfe || off.lfefsnr == 0)
+fn silent(off: &Offsets, slots: usize) -> bool {
+    off.csnr == 0 && off.fsnr.iter().take(slots).all(|f| *f == 0)
 }
 
-fn tally(alloc: &[Alloc], lfe: bool, off: Offsets) -> Tally {
+fn tally(alloc: &[Alloc], off: &Offsets) -> Tally {
     let mut t = [[0u32; 16]; 6];
-    if silent(off, lfe) {
+    if silent(off, alloc.len()) {
         return t;
     }
-    let nf = alloc.len() - usize::from(lfe);
-    for (c, a) in alloc.iter().enumerate() {
-        let fine = if c < nf { off.fsnr } else { off.lfefsnr };
+    for (a, fine) in alloc.iter().zip(off.fsnr) {
         add(&mut t, a, snr_offset(off.csnr, fine));
     }
     t
 }
 
-/// The largest offsets whose mantissas fit: `csnroffst` and the frame-wide `fsnroffst` by
-/// one binary search over `16·csnroffst + fsnroffst`, then the LFE's own `lfefsnroffst` as
-/// high as it still fits. `None` if not even silence fits.
-pub(crate) fn tune(alloc: &[Alloc], lfe: bool, budget: &Budget) -> Option<Offsets> {
+/// The largest offsets whose mantissas fit: `csnroffst` and one `fsnroffst` for every slot
+/// by one binary search over `16·csnroffst + fsnroffst`, then the LFE's (slot `lfe`) as high
+/// as it still fits. `None` if not even silence fits.
+pub(crate) fn tune(alloc: &[Alloc], lfe: Option<usize>, budget: &Budget) -> Option<Offsets> {
     let at = |v: u32| Offsets {
         csnr: (v >> 4) as u8,
-        fsnr: (v & 15) as u8,
-        lfefsnr: (v & 15) as u8,
+        fsnr: [(v & 15) as u8; MAX_SLOTS],
     };
-    if !fits(&tally(alloc, lfe, at(0)), budget) {
+    if !fits(&tally(alloc, &at(0)), budget) {
         return None;
     }
     let (mut lo, mut hi) = (0u32, 1024u32);
     while hi - lo > 1 {
         let mid = (lo + hi) / 2;
-        if fits(&tally(alloc, lfe, at(mid)), budget) {
+        if fits(&tally(alloc, &at(mid)), budget) {
             lo = mid;
         } else {
             hi = mid;
         }
     }
     let mut off = at(lo);
-    if lfe && !silent(off, lfe) {
-        let nf = alloc.len() - 1;
+    if let Some(l) = lfe.filter(|_| !silent(&off, alloc.len())) {
         let mut base = [[0u32; 16]; 6];
-        for a in &alloc[..nf] {
-            add(&mut base, a, snr_offset(off.csnr, off.fsnr));
+        for (c, a) in alloc.iter().enumerate().filter(|(c, _)| *c != l) {
+            add(&mut base, a, snr_offset(off.csnr, off.fsnr[c]));
         }
-        for fine in off.fsnr + 1..16 {
+        for fine in off.fsnr[l] + 1..16 {
             let mut t = base;
-            add(&mut t, &alloc[nf], snr_offset(off.csnr, fine));
+            add(&mut t, &alloc[l], snr_offset(off.csnr, fine));
             if !fits(&t, budget) {
                 break;
             }
-            off.lfefsnr = fine;
+            off.fsnr[l] = fine;
         }
     }
     Some(off)
 }
 
 /// Mantissa bits of each block at `off`.
-pub(crate) fn mantissa_bits(alloc: &[Alloc], lfe: bool, off: Offsets) -> [u32; 6] {
-    let t = tally(alloc, lfe, off);
+pub(crate) fn mantissa_bits(alloc: &[Alloc], off: &Offsets) -> [u32; 6] {
+    let t = tally(alloc, off);
     core::array::from_fn(|b| block_bits(&t[b]))
 }
 
 /// Writes every set's `bap` array at the chosen offsets.
-pub(crate) fn fill(alloc: &mut [Alloc], lfe: bool, off: Offsets) {
-    let nf = alloc.len() - usize::from(lfe);
-    let zero = silent(off, lfe);
-    for (c, a) in alloc.iter_mut().enumerate() {
-        let offset = snr_offset(off.csnr, if c < nf { off.fsnr } else { off.lfefsnr });
+pub(crate) fn fill(alloc: &mut [Alloc], off: &Offsets) {
+    let zero = silent(off, alloc.len());
+    for (a, fine) in alloc.iter_mut().zip(off.fsnr) {
+        let offset = snr_offset(off.csnr, fine);
         for s in 0..6 {
             if a.set[s] != s {
                 continue;
             }
             let bap = &mut a.bap[s];
-            for_each_bap(&a.psd[s], &a.mask[s], a.end, offset, |i, b| {
+            for_each_bap(&a.psd[s], &a.mask[s], a.start, a.end, offset, |i, b| {
                 bap[i] = if zero { 0 } else { b };
             });
         }
@@ -142,14 +137,14 @@ mod tests {
     use super::*;
     use crate::bitalloc::curve;
 
-    fn channel(end: usize, level: u8, sets: [usize; 6]) -> Alloc {
-        let mut a = Alloc::new(end);
+    fn channel(start: usize, end: usize, level: u8, sets: [usize; 6]) -> Alloc {
+        let mut a = Alloc::new(start, end);
         a.set = sets;
         for s in 0..6 {
             for (i, e) in a.exp[s].iter_mut().enumerate() {
                 *e = (level + (i % 9) as u8 / 3 + s as u8).min(24);
             }
-            curve(&a.exp[s], end, &mut a.psd[s], &mut a.mask[s]);
+            curve(&a.exp[s], start, end, &mut a.psd[s], &mut a.mask[s]);
         }
         a
     }
@@ -157,9 +152,10 @@ mod tests {
     #[test]
     fn the_winner_fills_without_overflow() {
         let alloc = [
-            channel(253, 3, [0, 0, 0, 3, 3, 3]),
-            channel(199, 6, [0, 1, 1, 1, 4, 4]),
-            channel(7, 2, [0, 0, 2, 2, 2, 2]),
+            channel(0, 253, 3, [0, 0, 0, 3, 3, 3]),
+            channel(0, 199, 6, [0, 1, 1, 1, 4, 4]),
+            channel(0, 7, 2, [0, 0, 2, 2, 2, 2]),
+            channel(133, 217, 4, [0, 1, 2, 3, 4, 5]),
         ];
         for frame in [4000u32, 8000, 12000, 20000] {
             let budget = Budget {
@@ -169,43 +165,43 @@ mod tests {
                 frame,
                 first: frame * 5 / 8,
             };
-            let off = tune(&alloc, true, &budget).expect("silence fits");
-            let t = tally(&alloc, true, off);
+            let off = tune(&alloc, Some(2), &budget).expect("silence fits");
+            let t = tally(&alloc, &off);
             assert!(fits(&t, &budget), "frame {frame}: {off:?}");
-            let v = 16 * u32::from(off.csnr) + u32::from(off.fsnr);
+            let v = 16 * u32::from(off.csnr) + u32::from(off.fsnr[0]);
             if v < 1023 {
-                let next = Offsets {
-                    csnr: ((v + 1) >> 4) as u8,
-                    fsnr: ((v + 1) & 15) as u8,
-                    lfefsnr: ((v + 1) & 15) as u8,
-                };
-                assert!(!fits(&tally(&alloc, true, next), &budget), "frame {frame}");
+                let mut next = off;
+                next.csnr = ((v + 1) >> 4) as u8;
+                next.fsnr = [((v + 1) & 15) as u8; MAX_SLOTS];
+                assert!(!fits(&tally(&alloc, &next), &budget), "frame {frame}");
             }
-            assert!(off.lfefsnr >= off.fsnr);
+            assert!(off.fsnr[2] >= off.fsnr[0]);
         }
     }
 
     #[test]
     fn fill_writes_what_the_tally_counted() {
-        let mut alloc = [channel(172, 4, [0, 0, 2, 2, 2, 5]), channel(7, 1, [0; 6])];
+        let mut alloc = [
+            channel(0, 172, 4, [0, 0, 2, 2, 2, 5]),
+            channel(0, 7, 1, [0; 6]),
+            channel(145, 253, 2, [0, 0, 0, 0, 0, 0]),
+        ];
         let off = Offsets {
             csnr: 20,
-            fsnr: 5,
-            lfefsnr: 9,
+            fsnr: [5, 9, 3, 0, 0, 0, 0],
         };
-        let want = tally(&alloc, true, off);
-        fill(&mut alloc, true, off);
+        let want = tally(&alloc, &off);
+        fill(&mut alloc, &off);
         let mut got = [[0u32; 16]; 6];
         for a in &alloc {
             for (b, g) in got.iter_mut().enumerate() {
-                for bin in 0..a.end {
+                for bin in a.start..a.end {
                     g[usize::from(a.bap[a.set[b]][bin])] += 1;
                 }
             }
         }
         assert_eq!(got, want);
-        let zero = Offsets::default();
-        fill(&mut alloc, true, zero);
+        fill(&mut alloc, &Offsets::default());
         assert!(
             alloc
                 .iter()

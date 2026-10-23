@@ -1,14 +1,17 @@
 //! The AC-3 frame: six blocks, the per-frame decisions that feed exponents, allocation and
-//! packing. Channel coupling (§8.2.4) is Stage 1b; `Coupling` is where its decision lands.
+//! packing, and channel coupling (§8.2.4) in `coupling`.
 
-use crate::bitalloc::{Alloc, Offsets, curve};
+pub(crate) mod coupling;
+
+use crate::bitalloc::{Alloc, MAX_SLOTS, Offsets, curve};
 use crate::bits::{BitWriter, Overflow, crc_shift_back};
 use crate::exponents::{D15, Groups, REUSE, encode, extract, plan};
-use crate::mantissas::{MAX_CH, Mantissas};
-use crate::pack::{self, Coupling, Side, Stream};
+use crate::mantissas::Mantissas;
+use crate::pack::{self, Side, Stream};
 use crate::tables::BITRATES;
 use crate::tuner::{self, Budget};
 use crate::{BLOCK_SAMPLES, Layout, mdct};
+use coupling::Bands;
 
 /// Samples a frame's six windows span: the frame and the 256 past it.
 pub(crate) const SPAN: usize = 6 * BLOCK_SAMPLES + BLOCK_SAMPLES;
@@ -16,30 +19,35 @@ pub(crate) const SPAN: usize = 6 * BLOCK_SAMPLES + BLOCK_SAMPLES;
 /// `endmant` of the LFE (§7.1.3).
 const LFE_END: usize = 7;
 
-/// One channel's frame up to the SNR offsets: transforms, raw exponents, the exponent
-/// sets and their masking curves. A set covers the blocks up to the next that sends one,
-/// with each bin's smallest exponent over them.
-fn analyse(
-    pcm: &[f32; SPAN],
-    coef: &mut [[f32; 256]; 6],
+/// The six blocks' transforms of one channel: one 512-point or a short pair each.
+fn transform(pcm: &[f32; SPAN], blksw: &[bool; 6], coef: &mut [[f32; 256]; 6]) {
+    for (b, out) in coef.iter_mut().enumerate() {
+        let Some(x) = pcm[BLOCK_SAMPLES * b..].first_chunk::<512>() else {
+            continue;
+        };
+        if blksw[b] {
+            mdct::short_pair(x, out);
+        } else {
+            mdct::long(x, out);
+        }
+    }
+}
+
+/// One slot's frame up to the SNR offsets: raw exponents, the exponent sets and their
+/// masking curves over `alloc.start..alloc.end`. A set covers the blocks up to the next
+/// that sends one, with each bin's smallest exponent over them.
+fn envelope(
+    coef: &[[f32; 256]; 6],
     raw: &mut [[u8; 256]; 6],
     side: &mut Side,
     alloc: &mut Alloc,
     lfe: bool,
 ) {
-    let end = alloc.end;
-    for b in 0..6 {
-        let Some(x) = pcm[BLOCK_SAMPLES * b..].first_chunk::<512>() else {
-            continue;
-        };
-        if side.blksw[b] {
-            mdct::short_pair(x, &mut coef[b]);
-        } else {
-            mdct::long(x, &mut coef[b]);
-        }
-        extract(&coef[b], end, &mut raw[b]);
+    let (start, end) = (alloc.start, alloc.end);
+    for (c, r) in coef.iter().zip(raw.iter_mut()) {
+        extract(c, end, r);
     }
-    side.strategy = plan(raw, end);
+    side.strategy = plan(raw, start, end);
     if lfe {
         for st in side.strategy.iter_mut().filter(|st| **st != REUSE) {
             *st = D15;
@@ -53,43 +61,68 @@ fn analyse(
             .count();
         let mut env = raw[b];
         for r in &raw[b + 1..b + len] {
-            for (e, v) in env.iter_mut().zip(r).take(end) {
+            for (e, v) in env.iter_mut().zip(r).take(end).skip(start) {
                 *e = (*e).min(*v);
             }
         }
         let strategy = side.strategy[b];
-        encode(&env, end, strategy, &mut side.groups[b], &mut alloc.exp[b]);
-        curve(&alloc.exp[b], end, &mut alloc.psd[b], &mut alloc.mask[b]);
+        encode(
+            &env,
+            start,
+            end,
+            strategy,
+            &mut side.groups[b],
+            &mut alloc.exp[b],
+        );
+        curve(
+            &alloc.exp[b],
+            start,
+            end,
+            &mut alloc.psd[b],
+            &mut alloc.mask[b],
+        );
         alloc.set[b..b + len].fill(b);
         b += len;
     }
 }
 
+/// The coupling range per rate, or the bandwidth code when nothing is coupled: the
+/// choices of ffmpeg's streams, as `probe dump` reads them.
+fn coupling_plan(layout: Layout, kbps: u32) -> (Option<Bands>, u8) {
+    let cpl = |begf, endf, strc| (Some(Bands { begf, endf, strc }), 0);
+    match (layout, kbps) {
+        (Layout::Stereo, ..=128) => cpl(1, 6, 0b1000_0000),
+        (Layout::Stereo, ..=160) => cpl(7, 8, 0b1010),
+        (Layout::Stereo, ..=192) => cpl(8, 12, 0b110_1100),
+        (Layout::Stereo, ..=224) => cpl(11, 12, 0b1100),
+        (Layout::Stereo, ..=256) => cpl(12, 12, 0b110),
+        (Layout::Stereo, _) => (None, 48),
+        (_, ..=256) => cpl(6, 5, 0),
+        (_, ..=320) => cpl(8, 8, 0b100),
+        (_, ..=384) => cpl(11, 10, 0),
+        (_, ..=512) => cpl(12, 12, 0b110),
+        _ => (None, 48),
+    }
+}
+
 pub(crate) struct Ac3 {
     stream: Stream,
-    /// Per channel in packing order (L C R Ls Rs, LFE last): `SPAN` samples from the
+    /// Per channel in slot order (L C R Ls Rs, then the LFE): `SPAN` samples from the
     /// frame's first.
     pcm: Box<[[f32; SPAN]]>,
+    /// Per slot: the channels', then the coupling channel's coefficients.
     coef: Box<[[[f32; 256]; 6]]>,
     raw: Box<[[[u8; 256]; 6]]>,
     side: Box<[Side]>,
     alloc: Box<[Alloc]>,
     mant: Box<Mantissas>,
-    coupling: Coupling,
+    coupling: Option<Box<coupling::Frame>>,
     /// Bits through block 1 of the last frame, which crc1 must cover.
     #[cfg(test)]
     first_bits: usize,
     /// Where block 5's mantissas start in the last frame, at or past the 5/8 point.
     #[cfg(test)]
     last_start: usize,
-}
-
-/// `chbwcod` from the rate each full-bandwidth channel gets: 15 kHz at 64 kbit/s,
-/// 19.5 kHz at 96, the full 23.7 kHz from 124 up.
-// ponytail: a straight line; Stage 1b's coupling sets the band edge per rate instead.
-fn bandwidth_code(kbps: u32, nfchans: usize) -> u8 {
-    let per = kbps / nfchans.max(1) as u32;
-    (per.saturating_sub(4) / 2).min(60) as u8
 }
 
 impl Ac3 {
@@ -103,39 +136,44 @@ impl Ac3 {
         let frame_bytes = 4 * BITRATES[rate] as usize;
         let words = frame_bytes / 2;
         let crc1_end = 2 * ((words >> 1) + (words >> 3));
-        let chbwcod = bandwidth_code(kbps, nfchans);
-        let end_of = |c: usize| {
-            if c < nfchans {
-                37 + 3 * (usize::from(chbwcod) + 12)
-            } else {
-                LFE_END
-            }
+        let (cpl, chbwcod) = coupling_plan(layout, kbps);
+        let stream = Stream {
+            acmod,
+            lfe,
+            nfchans,
+            frmsizecod: 2 * rate as u8,
+            chbwcod,
+            cpl,
+            frame_bytes,
+            crc1_end,
+            crc1_back: crc_shift_back(8 * (crc1_end - 2)),
         };
+        let range = |c: usize| match cpl {
+            Some(b) if c == nch => (b.start(), b.end()),
+            _ if c >= nfchans => (0, LFE_END),
+            Some(b) => (0, b.start()),
+            None => (0, 37 + 3 * (usize::from(chbwcod) + 12)),
+        };
+        let slots = stream.slots();
         Ac3 {
-            stream: Stream {
-                acmod,
-                lfe,
-                nfchans,
-                frmsizecod: 2 * rate as u8,
-                chbwcod,
-                frame_bytes,
-                crc1_end,
-                crc1_back: crc_shift_back(8 * (crc1_end - 2)),
-            },
+            stream,
             pcm: vec![[0.0; SPAN]; nch].into_boxed_slice(),
-            coef: vec![[[0.0; 256]; 6]; nch].into_boxed_slice(),
-            raw: vec![[[24; 256]; 6]; nch].into_boxed_slice(),
-            side: (0..nch)
+            coef: vec![[[0.0; 256]; 6]; slots].into_boxed_slice(),
+            raw: vec![[[24; 256]; 6]; slots].into_boxed_slice(),
+            side: (0..slots)
                 .map(|c| Side {
                     strategy: [REUSE; 6],
                     groups: [Groups::default(); 6],
                     blksw: [false; 6],
-                    end: end_of(c),
+                    start: range(c).0,
+                    end: range(c).1,
                 })
                 .collect(),
-            alloc: (0..nch).map(|c| Alloc::new(end_of(c))).collect(),
+            alloc: (0..slots)
+                .map(|c| Alloc::new(range(c).0, range(c).1))
+                .collect(),
             mant: Box::new(Mantissas::new()),
-            coupling: Coupling::default(),
+            coupling: cpl.map(|b| Box::new(coupling::Frame::new(b))),
             #[cfg(test)]
             first_bits: 0,
             #[cfg(test)]
@@ -147,7 +185,7 @@ impl Ac3 {
         self.stream.frame_bytes
     }
 
-    /// The input of every channel, in packing order.
+    /// The input of every channel, in slot order.
     pub(crate) fn pcm_mut(&mut self) -> &mut [[f32; SPAN]] {
         &mut self.pcm
     }
@@ -162,18 +200,31 @@ impl Ac3 {
     /// Encodes the frame in `pcm` into `out`, `frame_bytes` long.
     pub(crate) fn encode(&mut self, out: &mut [u8]) -> Result<(), Overflow> {
         let s = &self.stream;
-        for c in 0..self.pcm.len() {
-            analyse(
-                &self.pcm[c],
-                &mut self.coef[c],
+        let nf = s.nfchans;
+        for (c, p) in self.pcm.iter().enumerate() {
+            if let (Some(coef), Some(side)) = (self.coef.get_mut(c), self.side.get(c)) {
+                transform(p, &side.blksw, coef);
+            }
+        }
+        if let (Some(f), Some(cs)) = (self.coupling.as_deref_mut(), s.cpl_slot()) {
+            let (fbw, rest) = self.coef.split_at_mut(nf);
+            if let Some(cpl) = rest.get_mut(cs - nf) {
+                coupling::form(fbw, cpl, f);
+            }
+        }
+        let slots = s.slots();
+        for c in 0..slots {
+            envelope(
+                &self.coef[c],
                 &mut self.raw[c],
                 &mut self.side[c],
                 &mut self.alloc[c],
-                c >= s.nfchans,
+                Some(c) == s.lfe_slot(),
             );
         }
 
         // Side information does not depend on the offsets' values: a dry run sizes it.
+        let cpl = self.coupling.as_deref();
         let mut budget = Budget {
             header: 0,
             side: [0; 6],
@@ -187,32 +238,36 @@ impl Ac3 {
         for b in 0..6 {
             let at = w.position();
             let off = Offsets::default();
-            pack::block_side(&mut w, s, &self.side, self.coupling, off, b, None)?;
+            pack::block_side(&mut w, s, &self.side, cpl, &off, b, None)?;
             budget.side[b] = (w.position() - at) as u32;
         }
-        let lfe = s.lfe;
-        let off = tuner::tune(&self.alloc, lfe, &budget).ok_or(Overflow)?;
-        tuner::fill(&mut self.alloc, lfe, off);
-        let mant = tuner::mantissa_bits(&self.alloc, lfe, off);
+        let off = tuner::tune(&self.alloc, s.lfe_slot(), &budget).ok_or(Overflow)?;
+        tuner::fill(&mut self.alloc, &off);
+        let mant = tuner::mantissa_bits(&self.alloc, &off);
         let last_start =
             budget.header + (0..5).map(|b| budget.side[b] + mant[b]).sum::<u32>() + budget.side[5];
         let skips = pack::skips(budget.first.saturating_sub(last_start));
 
+        let (order, n) = s.order();
+        let order = &order[..n.min(MAX_SLOTS)];
         let mut w = BitWriter::new(out);
         pack::header(&mut w, s)?;
         for (b, skip) in skips.into_iter().enumerate() {
-            pack::block_side(&mut w, s, &self.side, self.coupling, off, b, skip)?;
+            pack::block_side(&mut w, s, &self.side, cpl, &off, b, skip)?;
             #[cfg(test)]
             if b == 5 {
                 self.last_start = w.position();
             }
             self.mant.begin_block();
-            for (c, a) in self.alloc.iter().enumerate().take(MAX_CH) {
+            for &c in order {
+                let (Some(a), Some(coef)) = (self.alloc.get(c), self.coef.get(c)) else {
+                    continue;
+                };
                 let set = a.set[b];
                 self.mant
-                    .channel(c, &self.coef[c][b], &a.exp[set], &a.bap[set], a.end);
+                    .channel(c, &coef[b], &a.exp[set], &a.bap[set], a.start, a.end);
             }
-            pack::mantissas(&mut w, &self.mant, &self.side)?;
+            pack::mantissas(&mut w, &self.mant, &self.side, order)?;
             #[cfg(test)]
             if b == 1 {
                 self.first_bits = w.position();
@@ -264,13 +319,59 @@ mod tests {
         }
     }
 
+    /// Each channel's coupling coordinates, as oxideav decodes them, are the square root of
+    /// its band energy over the coupling channel's, an eighth of it, within a step.
+    #[test]
+    fn coordinates_decode_to_the_band_energy_ratio() {
+        let mut enc = Ac3::new(Layout::Surround51, 320);
+        let mut state = audblk::Ac3State::new();
+        let mut out = vec![0u8; enc.frame_bytes()];
+        let mut pcm = vec![0f32; 1536 * 6];
+        let mut seed = 7u32;
+        for frame in 0..3 {
+            for (c, p) in enc.pcm_mut().iter_mut().enumerate() {
+                for v in p.iter_mut().skip(BLOCK_SAMPLES) {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    *v = [0.3, 0.02, 0.1, 0.05, 0.2, 0.0][c] * ((seed >> 9) as f32 / 4e6 - 1.0);
+                }
+            }
+            enc.encode(&mut out).unwrap();
+            let si = syncinfo::parse(&out).unwrap();
+            let b = bsi::parse(&out[5..]).unwrap();
+            audblk::decode_frame(&mut state, &si, &b, &out, &mut pcm).unwrap();
+            let f = enc.coupling.as_deref().unwrap();
+            let cs = enc.stream.cpl_slot().unwrap();
+            let edges = f.bands.edges();
+            for c in 0..5 {
+                let blk = (0..6).rev().find(|b| f.send[*b][c]).unwrap();
+                let mut lo = f.bands.start();
+                for (k, hi) in edges.iter().take(f.bands.count()).enumerate() {
+                    let energy =
+                        |s: usize| -> f32 { enc.coef[s][blk][lo..*hi].iter().map(|v| v * v).sum() };
+                    let want = (energy(c) / energy(cs)).sqrt() / 8.0;
+                    let got = state.cpl_coord[c][k];
+                    assert!(
+                        (got - want).abs() <= want / 16.0,
+                        "frame {frame} ch {c} band {k}: {got} for {want}"
+                    );
+                    lo = *hi;
+                }
+            }
+            enc.advance();
+        }
+    }
+
     /// oxideav's decoder, fed our frames, arrives at our exponents, PSD, masking curve and
     /// `bap` values; and blocks 0 and 1 end inside crc1's 5/8.
     #[test]
     fn oxideav_rebuilds_the_allocation() {
         for (layout, kbps) in [
             (Layout::Stereo, 128),
+            (Layout::Stereo, 192),
+            (Layout::Stereo, 320),
             (Layout::Surround51, 256),
+            (Layout::Surround51, 320),
+            (Layout::Surround51, 448),
             (Layout::Surround51, 640),
         ] {
             let mut enc = Ac3::new(layout, kbps);
@@ -294,13 +395,20 @@ mod tests {
                 audblk::decode_frame(&mut state, &si, &b, &out, &mut pcm).unwrap();
                 let nf = enc.stream.nfchans;
                 for (c, a) in enc.alloc.iter().enumerate() {
-                    let ox = &state.channels[if c < nf { c } else { audblk::MAX_FBW + 1 }];
-                    let (s, end) = (a.set[5], a.end);
-                    assert_eq!(ox.exp[..end], a.exp[s][..end], "channel {c}");
-                    assert_eq!(ox.psd[..end], a.psd[s][..end], "channel {c}");
-                    let bands = crate::tables::MASKTAB[end - 1] as usize + 1;
-                    assert_eq!(ox.mask[..bands], a.mask[s][..bands], "channel {c}");
-                    assert_eq!(ox.bap[..end], a.bap[s][..end], "channel {c}");
+                    let ox = match c {
+                        _ if Some(c) == enc.stream.cpl_slot() => audblk::MAX_FBW,
+                        _ if c >= nf => audblk::MAX_FBW + 1,
+                        _ => c,
+                    };
+                    let ox = &state.channels[ox];
+                    let (s, start, end) = (a.set[5], a.start, a.end);
+                    let what = format!("{layout:?} {kbps} slot {c}");
+                    assert_eq!(ox.exp[start..end], a.exp[s][start..end], "{what}");
+                    assert_eq!(ox.psd[start..end], a.psd[s][start..end], "{what}");
+                    let bands = crate::tables::MASKTAB[start] as usize
+                        ..crate::tables::MASKTAB[end - 1] as usize + 1;
+                    assert_eq!(ox.mask[bands.clone()], a.mask[s][bands], "{what}");
+                    assert_eq!(ox.bap[start..end], a.bap[s][start..end], "{what}");
                 }
                 enc.advance();
             }

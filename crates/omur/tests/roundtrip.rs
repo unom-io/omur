@@ -87,24 +87,25 @@ fn snr_db(want: &[f32], got: &[f32]) -> f64 {
 #[test]
 fn every_rate_decodes_with_both_crcs_and_its_header() {
     // (layout, kbps, SNR floor per channel in bitstream order: L C R Ls Rs LFE). Rs is the
-    // noise channel; above the coded bandwidth (15 kHz at 320) its energy is lost.
+    // noise channel; above the coded bandwidth (15.8 kHz at 320, 20.3 kHz at 448 and 640)
+    // its energy is lost.
     let cases: [(Layout, u32, &[f64]); 5] = [
-        (Layout::Stereo, 192, &[60.0, 55.0]),
-        (Layout::Stereo, 320, &[80.0, 80.0]),
+        (Layout::Stereo, 192, &[80.0, 75.0]),
+        (Layout::Stereo, 320, &[85.0, 82.0]),
         (
             Layout::Surround51,
             320,
-            &[32.0, 26.0, 26.0, 27.0, 3.0, 24.0],
+            &[38.0, 39.0, 36.0, 35.0, 3.0, 36.0],
         ),
         (
             Layout::Surround51,
             448,
-            &[42.0, 35.0, 37.0, 34.0, 5.0, 33.0],
+            &[50.0, 49.0, 45.0, 43.0, 6.0, 48.0],
         ),
         (
             Layout::Surround51,
             640,
-            &[52.0, 47.0, 45.0, 45.0, 15.0, 42.0],
+            &[66.0, 66.0, 61.0, 60.0, 7.0, 62.0],
         ),
     ];
     for (layout, kbps, floor) in cases {

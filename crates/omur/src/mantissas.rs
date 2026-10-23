@@ -4,8 +4,8 @@
 
 use crate::tables::{MANT_BITS, SYM_LEVELS};
 
-/// Channels a block packs: five full-bandwidth and the LFE.
-pub(crate) const MAX_CH: usize = 6;
+/// Channels a block packs: five full-bandwidth, the LFE and the coupling channel.
+pub(crate) const MAX_CH: usize = 7;
 
 /// `2^e` for every exponent, exact.
 const POW2: [f32; 25] = {
@@ -68,18 +68,20 @@ impl Mantissas {
         self.open = [(0, 0, 0); 3];
     }
 
-    /// Quantizes `coef[..end]` of packing channel `ch` against the exponents the decoder
-    /// rebuilds and the `bap` of each bin.
+    /// Quantizes `coef[start..end]` of slot `ch` against the exponents the decoder rebuilds
+    /// and the `bap` of each bin. Slots are quantized in packing order: groups run across
+    /// them.
     pub(crate) fn channel(
         &mut self,
         ch: usize,
         coef: &[f32; 256],
         exp: &[u8; 256],
         bap: &[u8; 256],
+        start: usize,
         end: usize,
     ) {
         let ch = ch.min(MAX_CH - 1);
-        for bin in 0..end.min(256) {
+        for bin in start..end.min(256) {
             let b = bap[bin] & 15;
             let m = coef[bin] * POW2[usize::from(exp[bin]).min(24)];
             let (code, bits) = match b {
@@ -162,7 +164,7 @@ mod tests {
                 for b in &bap[..end] {
                     count[*b as usize] += 1;
                 }
-                q.channel(ch, &coef, &[0; 256], &bap, end);
+                q.channel(ch, &coef, &[0; 256], &bap, 0, end);
             }
             let mut buf = [0u8; 4096];
             let mut w = BitWriter::new(&mut buf);
@@ -185,8 +187,8 @@ mod tests {
         let coef: [f32; 256] = core::array::from_fn(|i| ((i * 7) % 11) as f32 / 5.5 - 1.0);
         let mut bap = [0u8; 256];
         bap[..5].copy_from_slice(&[1, 4, 1, 2, 4]);
-        q.channel(0, &coef, &[0; 256], &bap, 5);
-        q.channel(1, &coef, &[0; 256], &bap, 5);
+        q.channel(0, &coef, &[0; 256], &bap, 0, 5);
+        q.channel(1, &coef, &[0; 256], &bap, 0, 5);
         // bap 1: (0,0) (0,2) (1,0); then (1,2) pads; bap 4: (0,1) (0,4); (1,1) (1,4).
         let one = |b: usize| symmetric(coef[b], 3);
         let eleven = |b: usize| symmetric(coef[b], 11);
