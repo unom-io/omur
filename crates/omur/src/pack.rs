@@ -36,6 +36,15 @@ impl Stream {
         self.cpl.map(|_| self.nfchans + usize::from(self.lfe))
     }
 
+    /// `nrematbd` (Table 4.10).
+    pub(crate) fn remat_bands(&self) -> usize {
+        match self.cpl.map(|b| b.begf) {
+            None | Some(3..) => 4,
+            Some(1 | 2) => 3,
+            Some(_) => 2,
+        }
+    }
+
     pub(crate) fn slots(&self) -> usize {
         self.nfchans + usize::from(self.lfe) + usize::from(self.cpl.is_some())
     }
@@ -97,19 +106,27 @@ pub(crate) fn header(w: &mut BitWriter, s: &Stream) -> Result<(), Overflow> {
     w.put(0b0000_1000, 8)
 }
 
+/// The frame's choices beyond each channel's: its coupling when the stream couples, and
+/// which rematrixing bands of a 2/0 stream hold sum and difference.
+#[derive(Clone, Copy)]
+pub(crate) struct Choices<'a> {
+    pub(crate) cpl: Option<&'a coupling::Frame>,
+    pub(crate) remat: [bool; 4],
+}
+
 /// Block `blk`'s fields ahead of its mantissas (§5.3.3), with `skip` bytes of skip field.
-/// Everything frame-wide goes in block 0 and is reused after; `cpl` is the frame's
-/// coupling when the stream couples.
+/// Everything frame-wide goes in block 0 and is reused after.
 pub(crate) fn block_side(
     w: &mut BitWriter,
     s: &Stream,
     side: &[Side],
-    cpl: Option<&coupling::Frame>,
+    choices: Choices,
     off: &Offsets,
     blk: usize,
     skip: Option<u16>,
 ) -> Result<(), Overflow> {
     let first = blk == 0;
+    let cpl = choices.cpl;
     let fbw = &side[..s.nfchans.min(side.len())];
     let lfe = s.lfe_slot().and_then(|l| side.get(l));
     let cs = s.cpl_slot().and_then(|c| side.get(c).map(|sd| (c, sd)));
@@ -154,12 +171,9 @@ pub(crate) fn block_side(
     if s.acmod == 2 {
         w.put(u32::from(first), 1)?; // rematstr
         if first {
-            let bands = match s.cpl.map(|b| b.begf) {
-                None | Some(3..) => 4,
-                Some(1 | 2) => 3,
-                Some(_) => 2,
-            };
-            w.put(0, bands)?; // rematflg: no band rematrixed
+            for flag in choices.remat.iter().take(s.remat_bands()) {
+                w.put(u32::from(*flag), 1)?; // rematflg
+            }
         }
     }
     if let Some((.., c)) = cpl {

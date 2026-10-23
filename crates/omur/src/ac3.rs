@@ -8,7 +8,7 @@ use crate::bitalloc::{Alloc, MAX_SLOTS, Offsets, curve};
 use crate::bits::{BitWriter, Overflow, crc_shift_back};
 use crate::exponents::{Groups, REUSE, encode, extract, plan};
 use crate::mantissas::Mantissas;
-use crate::pack::{self, Side, Stream};
+use crate::pack::{self, Choices, Side, Stream};
 use crate::tables::BITRATES;
 use crate::tuner::{self, Budget};
 use crate::{BLOCK_SAMPLES, Layout, mdct};
@@ -88,6 +88,46 @@ fn envelope(
     }
 }
 
+/// Rematrixes a 2/0 frame (§8.2.6): in each of the first `bands` rematrixing bands below
+/// `top`, the frame's L and R become (L + R)/2 and (L − R)/2 where that pair codes for
+/// less: noise at N in L and R needs N/2 in both of the pair, so the pair wins when four
+/// times the product of its energies is under the product of L's and R's. Returns the
+/// flags.
+fn rematrix(
+    l: &mut [[f32; 256]; 6],
+    r: &mut [[f32; 256]; 6],
+    bands: usize,
+    top: usize,
+) -> [bool; 4] {
+    const EDGES: [usize; 5] = [13, 25, 37, 61, 253];
+    let mut flags = [false; 4];
+    for (k, flag) in flags.iter_mut().enumerate().take(bands) {
+        let (lo, hi) = (EDGES[k], EDGES[k + 1].min(top));
+        if lo >= hi {
+            continue;
+        }
+        let mut e = [0f32; 4];
+        for (lb, rb) in l.iter().zip(r.iter()) {
+            for (a, b) in lb[lo..hi].iter().zip(&rb[lo..hi]) {
+                let (s, d) = (0.5 * (a + b), 0.5 * (a - b));
+                e[0] += a * a;
+                e[1] += b * b;
+                e[2] += s * s;
+                e[3] += d * d;
+            }
+        }
+        *flag = 4.0 * e[2] * e[3] < e[0] * e[1];
+        if *flag {
+            for (lb, rb) in l.iter_mut().zip(r.iter_mut()) {
+                for (a, b) in lb[lo..hi].iter_mut().zip(&mut rb[lo..hi]) {
+                    (*a, *b) = (0.5 * (*a + *b), 0.5 * (*a - *b));
+                }
+            }
+        }
+    }
+    flags
+}
+
 /// The coupling range per rate, or the bandwidth code when nothing is coupled: the
 /// choices of ffmpeg's streams, as `probe dump` reads them.
 fn coupling_plan(layout: Layout, kbps: u32) -> (Option<Bands>, u8) {
@@ -119,6 +159,8 @@ pub(crate) struct Ac3 {
     alloc: Box<[Alloc]>,
     mant: Box<Mantissas>,
     coupling: Option<Box<coupling::Frame>>,
+    /// The frame's rematrixing flags, 2/0 only.
+    remat: [bool; 4],
     transients: transient::Detector,
     /// Bits through block 1 of the last frame, which crc1 must cover.
     #[cfg(test)]
@@ -177,6 +219,7 @@ impl Ac3 {
                 .collect(),
             mant: Box::new(Mantissas::new()),
             coupling: cpl.map(|b| Box::new(coupling::Frame::new(b))),
+            remat: [false; 4],
             transients: transient::Detector::default(),
             #[cfg(test)]
             first_bits: 0,
@@ -233,6 +276,12 @@ impl Ac3 {
                 transform(p, &side.blksw, coef);
             }
         }
+        if s.acmod == 2
+            && let [l, r, ..] = &mut self.coef[..]
+        {
+            let top = s.cpl.map_or(self.alloc[0].end, |b| b.start());
+            self.remat = rematrix(l, r, s.remat_bands(), top);
+        }
         if let (Some(f), Some(cs)) = (self.coupling.as_deref_mut(), s.cpl_slot()) {
             let (fbw, rest) = self.coef.split_at_mut(nf);
             if let Some(cpl) = rest.get_mut(cs - nf) {
@@ -261,7 +310,10 @@ impl Ac3 {
     /// values: a dry run into `out` sizes it.
     fn size(&self, out: &mut [u8]) -> Result<Budget, Overflow> {
         let s = &self.stream;
-        let cpl = self.coupling.as_deref();
+        let choices = Choices {
+            cpl: self.coupling.as_deref(),
+            remat: self.remat,
+        };
         let mut budget = Budget {
             header: 0,
             side: [0; 6],
@@ -275,7 +327,7 @@ impl Ac3 {
         for b in 0..6 {
             let at = w.position();
             let off = Offsets::default();
-            pack::block_side(&mut w, s, &self.side, cpl, &off, b, None)?;
+            pack::block_side(&mut w, s, &self.side, choices, &off, b, None)?;
             budget.side[b] = (w.position() - at) as u32;
         }
         Ok(budget)
@@ -284,7 +336,10 @@ impl Ac3 {
     /// Writes the frame at `off`.
     fn write(&mut self, out: &mut [u8], budget: &Budget, off: &Offsets) -> Result<(), Overflow> {
         let s = &self.stream;
-        let cpl = self.coupling.as_deref();
+        let choices = Choices {
+            cpl: self.coupling.as_deref(),
+            remat: self.remat,
+        };
         tuner::fill(&mut self.alloc, off);
         let mant = tuner::mantissa_bits(&self.alloc, off);
         let last_start =
@@ -296,7 +351,7 @@ impl Ac3 {
         let mut w = BitWriter::new(out);
         pack::header(&mut w, s)?;
         for (b, skip) in skips.into_iter().enumerate() {
-            pack::block_side(&mut w, s, &self.side, cpl, off, b, skip)?;
+            pack::block_side(&mut w, s, &self.side, choices, off, b, skip)?;
             #[cfg(test)]
             if b == 5 {
                 self.last_start = w.position();
@@ -334,6 +389,48 @@ mod tests {
             assert!(self.first_bits <= five_eighths, "{what}: blocks 0-1");
             assert!(self.last_start >= five_eighths, "{what}: block 5");
         }
+    }
+
+    /// Nearly equal L and R are coded as sum and difference in every band, and oxideav,
+    /// undoing it, gets the input back.
+    #[test]
+    fn correlated_stereo_is_rematrixed() {
+        let mut enc = Ac3::new(Layout::Stereo, 192);
+        let mut state = audblk::Ac3State::new();
+        let mut out = vec![0u8; enc.frame_bytes()];
+        let mut pcm = vec![0f32; 1536 * 2];
+        let (mut want, mut got) = (Vec::<f32>::new(), Vec::<f32>::new());
+        for frame in 0..4 {
+            for (c, p) in enc.pcm_mut().iter_mut().enumerate() {
+                for (i, v) in p.iter_mut().enumerate().skip(BLOCK_SAMPLES) {
+                    let t = (frame * 1536 + i) as f32;
+                    let x = 0.3 * (t * 0.031).sin() + 0.2 * (t * 0.17).sin();
+                    *v = x * [1.0, 0.9][c] + [0.0, 0.01][c] * (t * 0.05).sin();
+                }
+            }
+            enc.encode(&mut out);
+            let si = syncinfo::parse(&out).unwrap();
+            let b = bsi::parse(&out[5..]).unwrap();
+            let side = audblk::parse_frame_side_info(&si, &b, &out).unwrap();
+            assert_eq!(side[0].rematflg, [true; 4], "frame {frame}");
+            audblk::decode_frame(&mut state, &si, &b, &out, &mut pcm).unwrap();
+            if frame > 0 {
+                // a frame decodes to its span's first 1536 samples
+                got.extend(pcm.iter().step_by(2));
+                want.extend(enc.pcm[0][..1536].iter());
+            }
+            enc.advance();
+        }
+        let (mut s, mut e) = (0f64, 0f64);
+        for (w, g) in want.iter().zip(&got) {
+            s += f64::from(*w).powi(2);
+            e += f64::from(w - g).powi(2);
+        }
+        assert!(
+            10.0 * (s / e).log10() > 40.0,
+            "{} dB",
+            10.0 * (s / e).log10()
+        );
     }
 
     /// The fallback frame, all offsets zero, fits every rate with the side information at
