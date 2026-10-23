@@ -26,3 +26,16 @@ jobs:
       - run: cargo test --workspace
       - run: cargo clippy -p omur --all-targets --features joc -- -D warnings
       - run: cargo test -p omur --features joc
+
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo +nightly install cargo-fuzz --version 0.13.2 --locked
+      # A minute per target from the checked-in seeds; a crash exits non-zero.
+      - run: |
+          for t in encode chunking api; do
+            mkdir -p fuzz/corpus/$t
+            cargo +nightly fuzz run $t fuzz/corpus/$t fuzz/seeds/$t -- -max_total_time=60
+          done
