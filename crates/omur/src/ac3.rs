@@ -170,6 +170,9 @@ pub(crate) struct Ac3 {
     /// Where block 5's mantissas start in the last frame, at or past the 5/8 point.
     #[cfg(test)]
     last_start: usize,
+    /// Frames that went out at the all-zero offsets.
+    #[cfg(test)]
+    fallbacks: usize,
 }
 
 impl Ac3 {
@@ -228,6 +231,8 @@ impl Ac3 {
             first_bits: 0,
             #[cfg(test)]
             last_start: 0,
+            #[cfg(test)]
+            fallbacks: 0,
         }
     }
 
@@ -259,6 +264,10 @@ impl Ac3 {
         let written = tuned.map(|off| self.write(out, &budget, &off));
         if !matches!(written, Some(Ok(()))) {
             let _ = self.write(out, &budget, &Offsets::default());
+            #[cfg(test)]
+            {
+                self.fallbacks += 1;
+            }
         }
     }
 
@@ -388,6 +397,7 @@ mod tests {
     impl Ac3 {
         /// §5.5: blocks 0 and 1 end inside the first 5/8; block 5's mantissas start past it.
         fn assert_constraints(&self, what: &str) {
+            assert_eq!(self.fallbacks, 0, "{what}: the tuned frame overflowed");
             let five_eighths = 8 * self.stream.crc1_end;
             assert!(self.first_bits <= five_eighths, "{what}: blocks 0-1");
             assert!(self.last_start >= five_eighths, "{what}: block 5");

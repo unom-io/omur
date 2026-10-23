@@ -155,17 +155,25 @@ pub(crate) fn tune(alloc: &[Alloc], budget: &Budget, hint: &mut u32) -> Option<O
     if lo == 0 {
         return Some(off);
     }
-    for f in off.fsnr.iter_mut() {
-        *f = f.saturating_sub(GIVE);
-    }
     let offset = |fine: u8| snr_offset(off.csnr, fine);
     let mut own = [[0u64; 6]; MAX_SLOTS];
     let mut next = [None; MAX_SLOTS];
     let mut total = [0u64; 6];
-    for (c, a) in alloc.iter().enumerate().take(slots) {
-        own[c] = channel(a, offset(off.fsnr[c]));
-        total = sum(&total, &own[c]);
-        next[c] = (off.fsnr[c] < 15).then(|| channel(a, offset(off.fsnr[c] + 1)));
+    // Grouping rounds, so a lower offset can cost a few bits more: the climb starts from
+    // the lowered offsets only if they still fit.
+    for give in [GIVE, 0] {
+        for f in off.fsnr.iter_mut() {
+            *f = ((lo & 15) as u8).saturating_sub(give);
+        }
+        total = [0; 6];
+        for (c, a) in alloc.iter().enumerate().take(slots) {
+            own[c] = channel(a, offset(off.fsnr[c]));
+            total = sum(&total, &own[c]);
+            next[c] = (off.fsnr[c] < 15).then(|| channel(a, offset(off.fsnr[c] + 1)));
+        }
+        if fits(&total, budget) {
+            break;
+        }
     }
     loop {
         let mut best: Option<(u32, usize, Tally)> = None;
