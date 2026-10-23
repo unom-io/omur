@@ -56,7 +56,9 @@ pub fn config(u: &mut Unstructured) -> Result<Option<Config>> {
         return Ok(None);
     }
     let kbps = *u.choose(ladder)?;
-    Ok(Some(Config::new(codec, layout, kbps).expect("a ladder entry")))
+    Ok(Some(
+        Config::new(codec, layout, kbps).expect("a ladder entry"),
+    ))
 }
 
 /// One to eight push lengths in samples per channel, each 1 to 4096, used in a cycle.
@@ -158,7 +160,12 @@ pub fn assert_syncframes(f: &omur::Frame) {
         [a, b] => a.start == 0 && a.end == b.start && b.end == f.bytes.len(),
         _ => false,
     };
-    assert!(ok, "syncframes {:?} of {} bytes", f.syncframes, f.bytes.len());
+    assert!(
+        ok,
+        "syncframes {:?} of {} bytes",
+        f.syncframes,
+        f.bytes.len()
+    );
 }
 
 fn feed(enc: &mut Encoder, pcm: &[f32], ch: usize, out: &mut Vec<(u64, Vec<u8>)>) {
