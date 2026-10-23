@@ -241,7 +241,7 @@ impl Ac3 {
             pack::block_side(&mut w, s, &self.side, cpl, &off, b, None)?;
             budget.side[b] = (w.position() - at) as u32;
         }
-        let off = tuner::tune(&self.alloc, s.lfe_slot(), &budget).ok_or(Overflow)?;
+        let off = tuner::tune(&self.alloc, &budget).ok_or(Overflow)?;
         tuner::fill(&mut self.alloc, &off);
         let mant = tuner::mantissa_bits(&self.alloc, &off);
         let last_start =

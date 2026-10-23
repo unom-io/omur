@@ -18,17 +18,30 @@ const POW2: [f32; 25] = {
     t
 };
 
-/// Mantissa bits of one block from how many of its mantissas, over all its channels, sit at
-/// each `bap`. Grouping runs across channels and pads at the block's end (§7.3.5): three
+/// One mantissa's cost at each `bap`, packed so that sums over bins and channels add field
+/// by field: the bits of an ungrouped `bap` in bits 0 to 15, then a count of bap 1, 2 and 4
+/// in each 16-bit field above. A block of seven channels stays below 2^16 in every field.
+pub(crate) const PACKED: [u64; 16] = {
+    let mut t = [0u64; 16];
+    let mut b = 0;
+    while b < 16 {
+        t[b] = match b {
+            1 => 1 << 16,
+            2 => 1 << 32,
+            4 => 1 << 48,
+            _ => MANT_BITS[b] as u64,
+        };
+        b += 1;
+    }
+    t
+};
+
+/// Mantissa bits of one block from the packed sum (`PACKED`) of its mantissas over all its
+/// channels. Grouping runs across channels and pads at the block's end (§7.3.5): three
 /// bap-1 values in 5 bits, three bap-2 in 7, two bap-4 in 7.
-pub(crate) fn block_bits(count: &[u32; 16]) -> u32 {
-    let grouped = 5 * count[1].div_ceil(3) + 7 * count[2].div_ceil(3) + 7 * count[4].div_ceil(2);
-    grouped
-        + count
-            .iter()
-            .zip(MANT_BITS)
-            .map(|(n, bits)| n * u32::from(bits))
-            .sum::<u32>()
+pub(crate) fn block_bits(sum: u64) -> u32 {
+    let field = |k: u32| (sum >> (16 * k)) as u32 & 0xffff;
+    field(0) + 5 * field(1).div_ceil(3) + 7 * field(2).div_ceil(3) + 7 * field(3).div_ceil(2)
 }
 
 /// The code of `m` on the `levels`-step symmetric quantizer (Tables 7.19 to 7.23).
@@ -146,7 +159,7 @@ mod tests {
         for trial in 0..40 {
             let mut q = Mantissas::new();
             q.begin_block();
-            let mut count = [0u32; 16];
+            let mut sum = 0u64;
             let channels = 1 + trial % MAX_CH;
             for ch in 0..channels {
                 let end = [7, 73, 253][(rnd(&mut seed) % 3) as usize];
@@ -162,7 +175,7 @@ mod tests {
                 let coef: [f32; 256] =
                     core::array::from_fn(|_| (rnd(&mut seed) % 2000) as f32 / 1000.0 - 1.0);
                 for b in &bap[..end] {
-                    count[*b as usize] += 1;
+                    sum += PACKED[*b as usize];
                 }
                 q.channel(ch, &coef, &[0; 256], &bap, 0, end);
             }
@@ -176,7 +189,7 @@ mod tests {
                     }
                 }
             }
-            assert_eq!(w.position() as u32, block_bits(&count), "trial {trial}");
+            assert_eq!(w.position() as u32, block_bits(sum), "trial {trial}");
         }
     }
 

@@ -177,16 +177,16 @@ pub(crate) fn curve(
     }
 }
 
-/// The final address step (§7.2.2.7): calls `f(bin, bap)` for every bin of `start..end` at
-/// SNR offset `offset`.
+/// The final address step (§7.2.2.7): calls `f(bin, address)` for every bin of
+/// `start..end` at SNR offset `offset`; `baptab[address]` is the bin's `bap`.
 #[inline]
-pub(crate) fn for_each_bap(
+pub(crate) fn for_each_address(
     psd: &[i16; 256],
     mask: &[i16; 50],
     start: usize,
     end: usize,
     offset: i32,
-    mut f: impl FnMut(usize, u8),
+    mut f: impl FnMut(usize, usize),
 ) {
     let end = end.min(MAX_END);
     let floor = FLOORTAB[FLOORCOD as usize];
@@ -196,12 +196,24 @@ pub(crate) fn for_each_bap(
         let last = (BNDTAB[band] as usize + BNDSZ[band] as usize).min(end);
         let m = ((i32::from(mask[band]) - offset - floor).max(0) & 0x1fe0) + floor;
         for (i, p) in psd.iter().enumerate().take(last).skip(bin) {
-            let address = ((i32::from(*p) - m) >> 5).clamp(0, 63);
-            f(i, BAPTAB[address as usize]);
+            f(i, ((i32::from(*p) - m) >> 5).clamp(0, 63) as usize);
         }
         bin = last;
         band += 1;
     }
+}
+
+/// `for_each_address` through `baptab`: calls `f(bin, bap)`.
+#[inline]
+pub(crate) fn for_each_bap(
+    psd: &[i16; 256],
+    mask: &[i16; 50],
+    start: usize,
+    end: usize,
+    offset: i32,
+    mut f: impl FnMut(usize, u8),
+) {
+    for_each_address(psd, mask, start, end, offset, |i, a| f(i, BAPTAB[a & 63]));
 }
 
 #[cfg(test)]
