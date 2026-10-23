@@ -270,7 +270,17 @@ fn read(sample: &[f32], slot: usize) -> f32 {
 
 /// Copies `chunk`'s samples of `src` into `dst`.
 fn copy_in(dst: &mut [f32], chunk: &[f32], channels: usize, src: Source) {
-    let samples = chunk.chunks_exact(channels);
+    match channels {
+        2 => copy_from::<2>(dst, chunk, src),
+        6 => copy_from::<6>(dst, chunk, src),
+        8 => copy_from::<8>(dst, chunk, src),
+        _ => {}
+    }
+}
+
+/// `copy_in` for `C` channels a sample.
+fn copy_from<const C: usize>(dst: &mut [f32], chunk: &[f32], src: Source) {
+    let samples = chunk.as_chunks::<C>().0;
     match src {
         Source::Wav(slot) => {
             for (d, s) in dst.iter_mut().zip(samples) {
