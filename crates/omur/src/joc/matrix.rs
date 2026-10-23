@@ -150,16 +150,21 @@ impl Sums {
         let mut inv = [[0f32; SPLIT]; CH];
         for i in 0..CH {
             for j in 0..=i {
+                let mut s = self.q[pair(i, j)];
                 for b in 0..nb {
-                    let mut s = self.q[pair(i, j)][b] + if i == j { lambda[b] } else { 0.0 };
-                    for k in 0..j {
-                        s -= l[i][k][b] * l[j][k][b];
+                    s[b] += if i == j { lambda[b] } else { 0.0 };
+                }
+                for k in 0..j {
+                    for b in 0..nb {
+                        s[b] -= l[i][k][b] * l[j][k][b];
                     }
+                }
+                for b in 0..nb {
                     if i == j {
-                        l[i][i][b] = s.max(1e-30).sqrt();
+                        l[i][i][b] = s[b].max(1e-30).sqrt();
                         inv[i][b] = 1.0 / l[i][i][b];
                     } else {
-                        l[i][j][b] = s * inv[j][b];
+                        l[i][j][b] = s[b] * inv[j][b];
                     }
                 }
             }
@@ -167,22 +172,29 @@ impl Sums {
         // (q + λ) m = -lin / 2 + λ·toward
         let mut z = [[0f32; SPLIT]; CH];
         for i in 0..CH {
+            let mut s = [0f32; SPLIT];
             for b in 0..nb {
-                let mut s = -0.5 * self.lin[i][b] + lambda[b] * toward[i][b];
-                for k in 0..i {
-                    s -= l[i][k][b] * z[k][b];
+                s[b] = -0.5 * self.lin[i][b] + lambda[b] * toward[i][b];
+            }
+            for k in 0..i {
+                for b in 0..nb {
+                    s[b] -= l[i][k][b] * z[k][b];
                 }
-                z[i][b] = s * inv[i][b];
+            }
+            for b in 0..nb {
+                z[i][b] = s[b] * inv[i][b];
             }
         }
         let mut m = [[0f32; SPLIT]; CH];
         for i in (0..CH).rev() {
-            for b in 0..nb {
-                let mut s = z[i][b];
-                for k in i + 1..CH {
-                    s -= l[k][i][b] * m[k][b];
+            let mut s = z[i];
+            for k in i + 1..CH {
+                for b in 0..nb {
+                    s[b] -= l[k][i][b] * m[k][b];
                 }
-                m[i][b] = s * inv[i][b];
+            }
+            for b in 0..nb {
+                m[i][b] = s[b] * inv[i][b];
             }
         }
         m.map(|m| m.map(|v| if v.is_finite() { v } else { 0.0 }))
