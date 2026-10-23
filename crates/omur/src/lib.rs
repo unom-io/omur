@@ -155,7 +155,8 @@ impl Config {
 
     /// Bytes of the independent syncframe, then of the dependent one (0 but on 7.1). 7.1
     /// splits the rate 7:5 by coded channels: 5.1 and a coupling channel, against four
-    /// channels and one. Each is 4,096 bytes at most on the ladder.
+    /// channels and one. Of 2:1, 3:2, 5:3 and 7:5, 7:5 keeps the probe signal's weakest
+    /// channel highest at 768 and 1,024 kbit/s. Each is 4,096 bytes at most on the ladder.
     fn syncframe_bytes(&self) -> [usize; 2] {
         // words = kbps · 1000 · samples / 48000 / 16 of the share num/den, to the nearest
         let words = |num: usize, den: usize| {
