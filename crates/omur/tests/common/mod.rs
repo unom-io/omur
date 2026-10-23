@@ -150,10 +150,13 @@ pub fn encode(config: Config, pcm: &[f32], chunk: usize) -> Vec<(u64, Vec<u8>)> 
 }
 
 /// ffmpeg, where it is on `PATH`, decodes `stream` without a message. `name` ends in the
-/// stream's extension.
+/// stream's extension. `OMUR_STREAMS=<dir>` keeps a copy of every stream there.
 pub fn ffmpeg_decodes(stream: &[u8], name: &str) {
     let path = std::env::temp_dir().join(format!("omur-{}-{name}", std::process::id()));
     std::fs::write(&path, stream).unwrap();
+    if let Ok(dir) = std::env::var("OMUR_STREAMS") {
+        let _ = std::fs::write(std::path::Path::new(&dir).join(name), stream);
+    }
     let out = std::process::Command::new("ffmpeg")
         .args(["-v", "error", "-i"])
         .arg(&path)
