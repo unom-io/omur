@@ -58,7 +58,13 @@ pub(crate) fn header(
     w.put(u32::from(s.lfe), 1)?;
     w.put(16, 5)?; // bsid
     w.put(31, 5)?; // dialnorm: -31 dB
-    w.put(0, 1)?; // compre
+    // compre marks the last dependent substream of a programme (E.2.8.5); its compr is 0 dB
+    if chanmap.is_some() {
+        w.put(1, 1)?;
+        w.put(0, 8)?;
+    } else {
+        w.put(0, 1)?;
+    }
     if let Some(map) = chanmap {
         w.put(1, 1)?; // chanmape
         w.put(u32::from(map), 16)?;

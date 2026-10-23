@@ -207,6 +207,9 @@ fn surround_71_is_a_substream_pair() {
                     "{what}"
                 );
                 assert_eq!((i0.num_blocks, d0.num_blocks), (n as u8, n as u8));
+                // the last dependent substream carries compr, at 0 dB
+                let compr = |b: &bsi::Bsi| b.compr.map(|c| c.raw());
+                assert_eq!((compr(&i0), compr(&d0)), (None, Some(0)), "{what}");
                 for sf in [&f[..at], &f[at..]] {
                     assert!(verify_packet_crc(sf).unwrap().all_ok(), "{what}");
                 }
