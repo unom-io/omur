@@ -251,10 +251,11 @@ impl Encoder {
         self.config
     }
 
-    /// Queue interleaved f32 in WAV order, any chunk length. Non-finite samples read as
-    /// silence. A frame is encoded as soon as [`Config::delay_samples`] have arrived past
-    /// its start. [`Error::Backlog`] refuses, and consumes nothing of, a push that would
-    /// complete a frame while the last one is unread — or complete two.
+    /// Queue interleaved f32 in WAV order, at most one frame ([`Config::frame_samples`],
+    /// 1536 on AC-3) per push. Non-finite samples read as silence. A frame is encoded as
+    /// soon as [`Config::delay_samples`] have arrived past its start. [`Error::Backlog`]
+    /// refuses, and consumes nothing of, a push that would complete a frame while the last
+    /// one is unread, or complete two — which a push longer than a frame can.
     pub fn push(&mut self, pcm: &[f32]) -> Result<(), Error> {
         let channels = self.config.layout.channels();
         if !pcm.len().is_multiple_of(channels) {

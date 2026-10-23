@@ -79,6 +79,9 @@ pub(crate) struct Ac3 {
     /// Bits through block 1 of the last frame, which crc1 must cover.
     #[cfg(test)]
     first_bits: usize,
+    /// Where block 5's mantissas start in the last frame, at or past the 5/8 point.
+    #[cfg(test)]
+    last_start: usize,
 }
 
 /// `chbwcod` from the rate each full-bandwidth channel gets: 15 kHz at 64 kbit/s,
@@ -135,6 +138,8 @@ impl Ac3 {
             coupling: Coupling::default(),
             #[cfg(test)]
             first_bits: 0,
+            #[cfg(test)]
+            last_start: 0,
         }
     }
 
@@ -181,17 +186,26 @@ impl Ac3 {
         budget.header = w.position() as u32;
         for b in 0..6 {
             let at = w.position();
-            pack::block_side(&mut w, s, &self.side, self.coupling, Offsets::default(), b)?;
+            let off = Offsets::default();
+            pack::block_side(&mut w, s, &self.side, self.coupling, off, b, None)?;
             budget.side[b] = (w.position() - at) as u32;
         }
         let lfe = s.lfe;
         let off = tuner::tune(&self.alloc, lfe, &budget).ok_or(Overflow)?;
         tuner::fill(&mut self.alloc, lfe, off);
+        let mant = tuner::mantissa_bits(&self.alloc, lfe, off);
+        let last_start =
+            budget.header + (0..5).map(|b| budget.side[b] + mant[b]).sum::<u32>() + budget.side[5];
+        let skips = pack::skips(budget.first.saturating_sub(last_start));
 
         let mut w = BitWriter::new(out);
         pack::header(&mut w, s)?;
-        for b in 0..6 {
-            pack::block_side(&mut w, s, &self.side, self.coupling, off, b)?;
+        for (b, skip) in skips.into_iter().enumerate() {
+            pack::block_side(&mut w, s, &self.side, self.coupling, off, b, skip)?;
+            #[cfg(test)]
+            if b == 5 {
+                self.last_start = w.position();
+            }
             self.mant.begin_block();
             for (c, a) in self.alloc.iter().enumerate().take(MAX_CH) {
                 let set = a.set[b];
@@ -213,7 +227,42 @@ impl Ac3 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxideav_ac3::{audblk, bsi, syncinfo};
+    use oxideav_ac3::{audblk, bsi, decoder, syncinfo};
+
+    impl Ac3 {
+        /// §5.5: blocks 0 and 1 end inside the first 5/8; block 5's mantissas start past it.
+        fn assert_constraints(&self, what: &str) {
+            let five_eighths = 8 * self.stream.crc1_end;
+            assert!(self.first_bits <= five_eighths, "{what}: blocks 0-1");
+            assert!(self.last_start >= five_eighths, "{what}: block 5");
+        }
+    }
+
+    /// Silence and a tone 80 dB down leave most of the frame unused; skip fields, not
+    /// auxdata, take the slack ahead of block 5.
+    #[test]
+    fn quiet_frames_keep_both_five_eighths_constraints() {
+        for layout in [Layout::Stereo, Layout::Surround51] {
+            for &kbps in crate::Config::bitrates(crate::Codec::Ac3, layout) {
+                for level in [0.0, 1e-4] {
+                    let mut enc = Ac3::new(layout, kbps);
+                    let mut out = vec![0u8; enc.frame_bytes()];
+                    for frame in 0..2 {
+                        for p in enc.pcm_mut().iter_mut() {
+                            for (i, v) in p.iter_mut().enumerate().skip(BLOCK_SAMPLES) {
+                                let t = (frame * 1536 + i) as f32;
+                                *v = level * (t * 0.05).sin();
+                            }
+                        }
+                        enc.encode(&mut out).unwrap();
+                        enc.assert_constraints(&format!("{layout:?} {kbps} level {level}"));
+                        assert!(decoder::verify_packet_crc(&out).unwrap().all_ok());
+                        enc.advance();
+                    }
+                }
+            }
+        }
+    }
 
     /// oxideav's decoder, fed our frames, arrives at our exponents, PSD, masking curve and
     /// `bap` values; and blocks 0 and 1 end inside crc1's 5/8.
@@ -239,10 +288,7 @@ mod tests {
                     }
                 }
                 enc.encode(&mut out).unwrap();
-                assert!(
-                    enc.first_bits <= 8 * enc.stream.crc1_end,
-                    "{layout:?} {kbps}"
-                );
+                enc.assert_constraints(&format!("{layout:?} {kbps}"));
                 let si = syncinfo::parse(&out).unwrap();
                 let b = bsi::parse(&out[5..]).unwrap();
                 audblk::decode_frame(&mut state, &si, &b, &out, &mut pcm).unwrap();

@@ -14,9 +14,13 @@ pub(crate) struct Budget {
     /// auxdatae, crcrsv and crc2.
     pub(crate) trailer: u32,
     pub(crate) frame: u32,
-    /// The first 5/8 of the frame, which must hold syncinfo, BSI and blocks 0 and 1 (§5.5).
+    /// The first 5/8 of the frame, which must hold syncinfo, BSI and blocks 0 and 1, and
+    /// which block 5's mantissas must not start inside (§5.5).
     pub(crate) first: u32,
 }
+
+/// What skip fields can overshoot by: a byte's rounding plus one more field's 9 bits.
+const SKIP_SLACK: u32 = 16;
 
 /// `bap` counts per block.
 type Tally = [[u32; 16]; 6];
@@ -41,10 +45,14 @@ fn add(tally: &mut Tally, a: &Alloc, offset: i32) {
     }
 }
 
+/// The frame holds it, blocks 0 and 1 end inside the first 5/8, and block 5's mantissas
+/// with the trailer fit the last 3/8 once skip fields move them there.
 fn fits(tally: &Tally, budget: &Budget) -> bool {
     let bits: [u32; 6] = core::array::from_fn(|b| budget.side[b] + block_bits(&tally[b]));
     let total = budget.header + bits.iter().sum::<u32>() + budget.trailer;
-    total <= budget.frame && budget.header + bits[0] + bits[1] <= budget.first
+    total <= budget.frame
+        && budget.header + bits[0] + bits[1] <= budget.first
+        && block_bits(&tally[5]) + budget.trailer + SKIP_SLACK <= budget.frame - budget.first
 }
 
 /// Offsets all zero mean every `bap` is zero (§7.2.2.1).
@@ -103,6 +111,12 @@ pub(crate) fn tune(alloc: &[Alloc], lfe: bool, budget: &Budget) -> Option<Offset
         }
     }
     Some(off)
+}
+
+/// Mantissa bits of each block at `off`.
+pub(crate) fn mantissa_bits(alloc: &[Alloc], lfe: bool, off: Offsets) -> [u32; 6] {
+    let t = tally(alloc, lfe, off);
+    core::array::from_fn(|b| block_bits(&t[b]))
 }
 
 /// Writes every set's `bap` array at the chosen offsets.

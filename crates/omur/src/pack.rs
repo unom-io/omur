@@ -60,8 +60,8 @@ pub(crate) fn header(w: &mut BitWriter, s: &Stream) -> Result<(), Overflow> {
     w.put(0b0000_1000, 8)
 }
 
-/// Block `blk`'s fields ahead of its mantissas (§5.3.3). Everything frame-wide goes in
-/// block 0 and is reused after.
+/// Block `blk`'s fields ahead of its mantissas (§5.3.3), with `skip` bytes of skip field.
+/// Everything frame-wide goes in block 0 and is reused after.
 pub(crate) fn block_side(
     w: &mut BitWriter,
     s: &Stream,
@@ -69,6 +69,7 @@ pub(crate) fn block_side(
     cpl: Coupling,
     off: Offsets,
     blk: usize,
+    skip: Option<u16>,
 ) -> Result<(), Overflow> {
     let first = blk == 0;
     let fbw = &side[..s.nfchans.min(side.len())];
@@ -133,7 +134,28 @@ pub(crate) fn block_side(
         }
     }
     w.put(0, 1)?; // deltbaie
-    w.put(0, 1) // skiple
+    w.put(u32::from(skip.is_some()), 1)?; // skiple
+    if let Some(n) = skip {
+        w.put(u32::from(n), 9)?;
+        w.zeros(8 * usize::from(n))?;
+    }
+    Ok(())
+}
+
+/// Skip fields in blocks 2 to 4 that move block 5's mantissas `deficit` bits later, to the
+/// 5/8 point (§5.5 constraint 2). Each costs 9 bits plus its bytes, 511 at most.
+pub(crate) fn skips(deficit: u32) -> [Option<u16>; 6] {
+    let mut out = [None; 6];
+    let mut left = deficit;
+    for s in out[2..5].iter_mut() {
+        if left == 0 {
+            break;
+        }
+        let bytes = left.saturating_sub(9).div_ceil(8).min(511);
+        *s = Some(bytes as u16);
+        left = left.saturating_sub(9 + 8 * bytes);
+    }
+    out
 }
 
 fn exponents(w: &mut BitWriter, g: &Groups) -> Result<(), Overflow> {
