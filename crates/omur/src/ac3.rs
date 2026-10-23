@@ -596,7 +596,7 @@ mod tests {
     #[test]
     fn silence_fits_every_rate() {
         for config in configs() {
-            let mut enc = Ac3::new(config.core());
+            let mut enc = Ac3::new(config.cores().0);
             if enc.stream.eac3() {
                 assert!(enc.ext_room > 0, "{config:?}");
                 let full = vec![0x5a; enc.ext_room + 1];

@@ -126,26 +126,6 @@ fn every_length_and_rate_decodes_with_its_header() {
     }
 }
 
-#[test]
-fn output_does_not_depend_on_the_chunking() {
-    for (layout, blocks, kbps) in [
-        (Layout::Surround51, Blocks::One, 448),
-        (Layout::Surround51, Blocks::Three, 640),
-        (Layout::Stereo, Blocks::Two, 192),
-        (Layout::Surround51, Blocks::Six, 1024),
-    ] {
-        let config = Config::new(eac3(blocks), layout, kbps).unwrap();
-        let pcm = signal(layout, 4 * 1536);
-        let whole = encode(config, &pcm, 240);
-        for chunk in [1, 77, 256, 1000, 1536] {
-            assert!(
-                encode(config, &pcm, chunk) == whole,
-                "{layout:?} {blocks:?} chunk {chunk}"
-            );
-        }
-    }
-}
-
 /// The bytes `set_extension` hands over come back, in order, from the skip fields of the
 /// frame after it, which still decodes; AC-3 and an oversized payload are refused.
 #[test]
@@ -197,5 +177,80 @@ fn extensions_ride_the_next_frames_skip_fields() {
             assert!(verify_packet_crc(f).unwrap().all_ok(), "{what}");
         }
         ffmpeg_decodes(&frames.concat(), &format!("ext-{blocks:?}-{kbps}"));
+    }
+}
+
+/// 7.1 as an independent 5.1 substream with the surrounds folded, then a dependent one
+/// with Ls, Rs and the rear pair: oxideav rebuilds eight channels from the pair and the
+/// fold from the independent substream alone, at every length and rate.
+#[test]
+fn surround_71_is_a_substream_pair() {
+    use bsi::StreamType;
+    let layout = Layout::Surround71;
+    // oxideav's order: L C R, Ls Rs (replaced), LFE, then Lrs Rrs (extended); the floor
+    // of each at the lowest rate and one block, Rrs the noise, then of the folds
+    let wav = [0, 2, 1, 6, 7, 3, 4, 5];
+    let floor = [35.0, 26.0, 25.0, 10.0, 25.0, 28.0, 23.0, 2.0, 16.0, 8.0];
+    for blocks in BLOCKS {
+        for &kbps in Config::bitrates(eac3(blocks), layout) {
+            let what = format!("{blocks:?} {kbps}");
+            let config = Config::new(eac3(blocks), layout, kbps).unwrap();
+            let n = blocks.count();
+            let pcm = signal(layout, 9 * 1536);
+            let frames = encode(config, &pcm, 240);
+            let mut first = vec![];
+            for (_, f) in &frames {
+                assert_eq!(f.len(), config.frame_bytes(), "{what}");
+                let i0 = bsi::parse(&f[2..]).unwrap();
+                let at = i0.frame_bytes as usize;
+                let d0 = bsi::parse(&f[at + 2..]).unwrap();
+                assert_eq!(at + d0.frame_bytes as usize, f.len(), "{what}");
+                assert!(at <= 4096 && f.len() - at <= 4096, "{what}");
+                assert_eq!(
+                    (i0.strmtyp, i0.acmod, i0.lfeon, i0.chanmap),
+                    (StreamType::Independent, 7, true, None)
+                );
+                assert_eq!(
+                    (
+                        d0.strmtyp,
+                        d0.substreamid,
+                        d0.acmod,
+                        d0.lfeon,
+                        d0.chanmap,
+                        d0.convsync
+                    ),
+                    (StreamType::Dependent, 0, 6, false, Some(0x1a00), None),
+                    "{what}"
+                );
+                assert_eq!((i0.num_blocks, d0.num_blocks), (n as u8, n as u8));
+                for sf in [&f[..at], &f[at..]] {
+                    assert!(verify_packet_crc(sf).unwrap().all_ok(), "{what}");
+                }
+                first.push((0, f[..at].to_vec()));
+            }
+            let end = frames.len() * 256 * n;
+            let channel =
+                |slot: usize| -> Vec<f32> { pcm.iter().skip(slot).step_by(8).copied().collect() };
+            for (c, slot) in wav.iter().enumerate() {
+                let snr = snr_db(
+                    &channel(*slot)[1536..end],
+                    &decode(&frames, 8)[c][1536..end],
+                );
+                assert!(snr > floor[c], "{what}: channel {c} at {snr:.1} dB");
+            }
+            // a 5.1 receiver: the fold in Ls and Rs
+            let alone = decode(&first, 6);
+            for (c, (side, back)) in [(3, (6, 4)), (4, (7, 5))] {
+                let fold: Vec<f32> = channel(side)
+                    .iter()
+                    .zip(channel(back))
+                    .map(|(s, b)| (s + b) * std::f32::consts::FRAC_1_SQRT_2)
+                    .collect();
+                let snr = snr_db(&fold[1536..end], &alone[c][1536..end]);
+                assert!(snr > floor[c + 5], "{what}: fold {c} at {snr:.1} dB");
+            }
+            let stream: Vec<u8> = frames.iter().flat_map(|(_, f)| f.clone()).collect();
+            ffmpeg_decodes(&stream, &format!("71-{blocks:?}-{kbps}"));
+        }
     }
 }

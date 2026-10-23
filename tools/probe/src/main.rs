@@ -1,8 +1,10 @@
 // AC-3 encoder probe: omur or a reference Rust encoder vs ffmpeg's ac3, decoded by ffmpeg.
 // usage: probe gen <out.s16> | enc <in.s16> <out.ac3> <kbps> | cmp <ref.s16> <dec.f32>
-//        | dump <stream.ac3> [summary]
-// `enc` and `cmp` read `CH` channels (6, or 2 for FL FR); `enc` feeds `CHUNK` samples a push.
-// omur's `enc` writes E-AC-3 with `BLOCKS` blocks a frame (1, 2, 3 or 6) when it is set.
+//        | dump <stream.ac3> [summary] | fold <in8.s16> <out6.s16>
+// `gen`, `enc` and `cmp` take `CH` channels (6; 2 for FL FR; 8 for 7.1); `enc` feeds `CHUNK`
+// samples a push. omur's `enc` writes E-AC-3 with `BLOCKS` blocks a frame (1, 2, 3 or 6)
+// when it is set, and always for 7.1; `SUBSTREAM=0` keeps only the independent syncframes.
+// `fold` writes the 5.1 a receiver plays from 7.1's independent substream alone.
 mod dump;
 
 use std::f32::consts::PI;
@@ -17,7 +19,7 @@ use {vuio_codec_ac3 as ac3, vuio_codec_core as codec_core};
 use codec_core::{AudioFrame, CodecId, CodecParameters, Error, Frame, SampleFormat};
 
 const SR: usize = 48_000;
-const CH: usize = 6; // WAV order: FL FR FC LFE SL SR
+const CH: usize = 6; // WAV order: FL FR FC LFE SL SR; 7.1 adds SL SR after BL BR
 
 /// Channels `enc` and `cmp` read: `CH` from the environment, 6 by default.
 fn channels() -> usize {
@@ -41,6 +43,14 @@ fn codec() -> omur::Codec {
     omur::Codec::Eac3 { blocks }
 }
 
+/// Channel names of a `ch`-channel WAV-order file.
+fn names(ch: usize) -> &'static [&'static str] {
+    match ch {
+        8 => &["FL", "FR", "FC", "LFE", "BL", "BR", "SL", "SR"],
+        _ => &["FL", "FR", "FC", "LFE", "SL", "SR"],
+    }
+}
+
 /// Samples per push: `CHUNK` from the environment, 5 ms by default.
 fn chunk() -> usize {
     std::env::var("CHUNK")
@@ -49,15 +59,30 @@ fn chunk() -> usize {
         .unwrap_or(SR / 200)
 }
 
-fn generate(path: &str) {
-    let n = SR * 10;
-    let mut seed = 0x1234_5678u32;
-    let mut rnd = move || {
+/// White noise in -1..1 from an LCG seeded with `seed`.
+fn noise(mut seed: u32) -> impl FnMut() -> f32 {
+    move || {
         seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
         (seed >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0
-    };
-    let mut pink = [0f32; 3];
-    let mut out = Vec::with_capacity(n * CH);
+    }
+}
+
+/// Pinkish noise from white `wn`, filter state in `p`.
+fn pink(p: &mut [f32; 3], wn: f32) -> f32 {
+    p[0] = 0.997 * p[0] + 0.029 * wn;
+    p[1] = 0.985 * p[1] + 0.032 * wn;
+    p[2] = 0.950 * p[2] + 0.048 * wn;
+    (p[0] + p[1] + p[2] + 0.02 * wn) * 2.0
+}
+
+fn generate(path: &str) {
+    let n = SR * 10;
+    let ch = channels();
+    let mut rnd = noise(0x1234_5678);
+    let mut rnd71 = noise(0x0bad_cafe);
+    let mut pink5 = [0f32; 3];
+    let mut pink7 = [0f32; 3];
+    let mut out = Vec::with_capacity(n * ch * 2);
     for i in 0..n {
         let t = i as f32 / SR as f32;
         // FL: harmonic tone with tremolo (music-like)
@@ -79,11 +104,7 @@ fn generate(path: &str) {
         // LFE: 40 + 80 Hz
         let lfe = 0.3 * (2.0 * PI * 40.0 * t).sin() + 0.15 * (2.0 * PI * 80.0 * t).sin();
         // SL: pinkish noise
-        let wn = rnd();
-        pink[0] = 0.997 * pink[0] + 0.029 * wn;
-        pink[1] = 0.985 * pink[1] + 0.032 * wn;
-        pink[2] = 0.950 * pink[2] + 0.048 * wn;
-        let sl = (pink[0] + pink[1] + pink[2] + 0.02 * wn) * 2.0;
+        let sl = pink(&mut pink5, rnd());
         // SR: gunshot-like decaying noise bursts every 250 ms, silence between
         let ph = t % 0.25;
         let sr = if ph < 0.08 {
@@ -91,7 +112,14 @@ fn generate(path: &str) {
         } else {
             0.0
         };
-        for s in [fl, fr, fc, lfe, sl, sr] {
+        // 7.1's sides: a 3 kHz tone with a 0.5 Hz swell, and pinkish noise of its own
+        let side_l = 0.25 * (2.0 * PI * 3000.0 * t).sin() * (0.6 + 0.4 * (PI * t).sin());
+        let side_r = if ch == 8 {
+            pink(&mut pink7, rnd71())
+        } else {
+            0.0
+        };
+        for s in [fl, fr, fc, lfe, sl, sr, side_l, side_r].iter().take(ch) {
             out.extend_from_slice(&((s.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes());
         }
     }
@@ -106,12 +134,21 @@ fn enc(inp: &str, outp: &str, kbps: u64) {
         .chunks_exact(2)
         .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
         .collect();
-    let layout = if ch == 2 {
-        omur::Layout::Stereo
-    } else {
-        omur::Layout::Surround51
+    let (layout, codec) = match ch {
+        2 => (omur::Layout::Stereo, codec()),
+        8 => match codec() {
+            omur::Codec::Ac3 => (
+                omur::Layout::Surround71,
+                omur::Codec::Eac3 {
+                    blocks: omur::Blocks::Six,
+                },
+            ),
+            c => (omur::Layout::Surround71, c),
+        },
+        _ => (omur::Layout::Surround51, codec()),
     };
-    let config = omur::Config::new(codec(), layout, kbps as u32).unwrap();
+    let independent_only = std::env::var("SUBSTREAM").is_ok_and(|s| s == "0");
+    let config = omur::Config::new(codec, layout, kbps as u32).unwrap();
     let mut e = omur::Encoder::new(config).unwrap();
     // the tail: silence until the frame holding the last sample is out
     let mut input = pcm;
@@ -132,7 +169,11 @@ fn enc(inp: &str, outp: &str, kbps: u64) {
                 if dt > slowest {
                     (slowest, slow_at) = (dt, frame.pts);
                 }
-                out.extend_from_slice(frame.bytes);
+                let bytes = match frame.syncframes.first() {
+                    Some(r) if independent_only => &frame.bytes[r.clone()],
+                    _ => frame.bytes,
+                };
+                out.extend_from_slice(bytes);
             }
         }
     }
@@ -220,7 +261,7 @@ fn cmp(refp: &str, decp: &str) {
         .collect();
     let (nr, nd) = (r.len() / ch_n, d.len() / ch_n);
     let ch = |v: &[f32], c: usize, n: usize| (0..n).map(|i| v[i * ch_n + c]).collect::<Vec<f32>>();
-    let names = ["FL", "FR", "FC", "LFE", "SL", "SR"];
+    let names = names(ch_n);
     // one lag for the whole stream: search on FL
     let rf = ch(&r, 0, nr);
     let df = ch(&d, 0, nd);
@@ -273,6 +314,34 @@ fn cmp(refp: &str, decp: &str) {
     }
 }
 
+/// 7.1 in WAV order to the 5.1 its independent substream carries: each surround is the side
+/// and the back at -3 dB.
+fn fold(inp: &str, outp: &str) {
+    let r: Vec<i16> = std::fs::read(inp)
+        .unwrap()
+        .chunks_exact(2)
+        .map(|b| i16::from_le_bytes([b[0], b[1]]))
+        .collect();
+    let mut out = Vec::with_capacity(r.len() / 8 * 12);
+    for s in r.chunks_exact(8) {
+        let f = |a: usize, b: usize| {
+            (f32::from(s[a]) + f32::from(s[b])) * std::f32::consts::FRAC_1_SQRT_2
+        };
+        let six = [
+            f32::from(s[0]),
+            f32::from(s[1]),
+            f32::from(s[2]),
+            f32::from(s[3]),
+            f(4, 6),
+            f(5, 7),
+        ];
+        for v in six {
+            out.extend_from_slice(&(v.round().clamp(-32768.0, 32767.0) as i16).to_le_bytes());
+        }
+    }
+    std::fs::write(outp, out).unwrap();
+}
+
 fn main() {
     let a: Vec<String> = std::env::args().collect();
     match a[1].as_str() {
@@ -280,6 +349,7 @@ fn main() {
         "enc" => enc(&a[2], &a[3], a[4].parse().unwrap()),
         "cmp" => cmp(&a[2], &a[3]),
         "dump" => dump::dump(&a[2], a.get(3).is_some_and(|s| s == "summary")),
-        _ => panic!("gen | enc | cmp | dump"),
+        "fold" => fold(&a[2], &a[3]),
+        _ => panic!("gen | enc | cmp | dump | fold"),
     }
 }

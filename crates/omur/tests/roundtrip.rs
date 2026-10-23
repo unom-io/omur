@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{encode, signal};
+use common::{encode, ladder, signal};
 use omur::{Codec, Config, Encoder, Error, Layout};
 use oxideav_ac3::{audblk, bsi, decoder, syncinfo};
 
@@ -101,12 +101,17 @@ fn every_rate_decodes_with_both_crcs_and_its_header() {
 
 #[test]
 fn output_does_not_depend_on_the_chunking() {
-    let config = Config::new(Codec::Ac3, Layout::Surround51, 384).unwrap();
-    let pcm = signal(Layout::Surround51, 10 * 1536);
-    let whole = encode(config, &pcm, 240);
-    assert_eq!(whole.len(), 9);
-    for chunk in [1, 1000, 1536, 4096] {
-        assert!(encode(config, &pcm, chunk) == whole, "chunk {chunk}");
+    for config in ladder() {
+        let pcm = signal(config.layout(), 4 * 1536);
+        let whole = encode(config, &pcm, 240);
+        let frames = 1 + (4 * 1536 - config.delay_samples()) / config.frame_samples();
+        assert_eq!(whole.len(), frames, "{config:?}");
+        for chunk in [1, 77, 1000, 1536, 4096] {
+            assert!(
+                encode(config, &pcm, chunk) == whole,
+                "{config:?} chunk {chunk}"
+            );
+        }
     }
 }
 

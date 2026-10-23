@@ -3,12 +3,27 @@
 // Each test binary uses part of this module.
 #![allow(dead_code)]
 
-use omur::{Config, Encoder, Error, Layout};
+use omur::{Blocks, Codec, Config, Encoder, Error, Layout};
 
 const RATE: f32 = 48_000.0;
 
-/// Tones per channel in WAV order, plus noise on the back right: `frames` interleaved
-/// samples of `layout`.
+/// Every configuration the ladder allows: each codec and frame length, layout and rate.
+pub fn ladder() -> Vec<Config> {
+    let eac3 =
+        [Blocks::One, Blocks::Two, Blocks::Three, Blocks::Six].map(|blocks| Codec::Eac3 { blocks });
+    let mut out = vec![];
+    for codec in [Codec::Ac3].into_iter().chain(eac3) {
+        for layout in [Layout::Stereo, Layout::Surround51, Layout::Surround71] {
+            for &kbps in Config::bitrates(codec, layout) {
+                out.push(Config::new(codec, layout, kbps).unwrap());
+            }
+        }
+    }
+    out
+}
+
+/// Tones per channel in WAV order, plus noise on the back right and slow tremolo on the
+/// side left: `frames` interleaved samples of `layout`.
 pub fn signal(layout: Layout, frames: usize) -> Vec<f32> {
     let ch = layout.channels();
     let mut seed = 0x9e37_79b9u32;
@@ -25,6 +40,8 @@ pub fn signal(layout: Layout, frames: usize) -> Vec<f32> {
             tone(50.0, 0.4),
             tone(880.0, 0.2) + tone(5000.0, 0.03),
             0.2 * noise,
+            tone(3000.0, 0.2) * (0.6 + 0.4 * tone(2.0, 1.0)),
+            tone(1100.0, 0.25) + tone(7000.0, 0.02),
         ];
         out.extend_from_slice(&wav[..ch]);
     }
@@ -38,8 +55,13 @@ pub fn encode(config: Config, pcm: &[f32], chunk: usize) -> Vec<(u64, Vec<u8>)> 
         match enc.push(pcm) {
             Ok(()) => {
                 if let Some(f) = enc.pull() {
-                    assert_eq!(f.syncframes.len(), 1);
-                    assert_eq!(f.syncframes[0], 0..f.bytes.len());
+                    // one syncframe, or 7.1's pair, back to back
+                    let ends: Vec<usize> = f.syncframes.iter().map(|r| r.end).collect();
+                    let starts: Vec<usize> = f.syncframes.iter().map(|r| r.start).collect();
+                    assert!(matches!(ends.len(), 1 | 2));
+                    assert_eq!(starts[0], 0);
+                    assert_eq!(starts[1..], ends[..ends.len() - 1]);
+                    assert_eq!(ends.last(), Some(&f.bytes.len()));
                     out.push((f.pts, f.bytes.to_vec()));
                 }
             }

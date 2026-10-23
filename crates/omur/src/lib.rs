@@ -17,8 +17,8 @@
 //!
 //! Object audio (ETSI TS 103 420) is the [`joc`] module, behind the `joc` feature.
 //!
-//! Status: AC-3 and E-AC-3 (every frame length) 2.0 and 5.1, with coupling and block
-//! switching; E-AC-3 7.1 is P2 (`docs/design.md`).
+//! Status: AC-3 2.0 and 5.1, E-AC-3 2.0, 5.1 and 7.1 at every frame length, with coupling
+//! and block switching (`docs/design.md`).
 
 mod ac3;
 mod bitalloc;
@@ -34,6 +34,7 @@ mod tables;
 mod tables_gen;
 mod tuner;
 
+use core::f32::consts::FRAC_1_SQRT_2;
 use core::fmt;
 use core::ops::Range;
 
@@ -144,30 +145,58 @@ impl Config {
     }
 
     /// Bytes in one access unit: one syncframe, or the pair a 7.1 E-AC-3 stream writes.
-    /// AC-3 frames are fixed by `frmsizecod`; an E-AC-3 frame is whole 16-bit words, so the
-    /// rate rounds to the nearest word (1.5 kbit/s at most).
+    /// AC-3 frames are fixed by `frmsizecod`; an E-AC-3 syncframe is whole 16-bit words, so
+    /// its share of the rate rounds to the nearest word (1.5 kbit/s at most). The 7.1 pair
+    /// is the sum of its two syncframes, each rounded on its own.
     pub fn frame_bytes(&self) -> usize {
-        // bits = kbps * 1000 * samples / 48000; words = bits / 16; rounded to nearest.
-        let words = (self.bitrate_kbps as usize * self.frame_samples() + 384) / 768;
-        2 * words
+        let [independent, dependent] = self.syncframe_bytes();
+        independent + dependent
     }
 
-    /// The core that codes the stream: AC-3, or E-AC-3's independent substream.
-    pub(crate) fn core(&self) -> ac3::Core {
-        let (acmod, lfe) = match self.layout {
-            Layout::Stereo => (2, false),
-            _ => (7, true),
+    /// Bytes of the independent syncframe, then of the dependent one (0 but on 7.1). 7.1
+    /// splits the rate 7:5 by coded channels: 5.1 and a coupling channel, against four
+    /// channels and one. Each is 4,096 bytes at most on the ladder.
+    fn syncframe_bytes(&self) -> [usize; 2] {
+        // words = kbps · 1000 · samples / 48000 / 16 of the share num/den, to the nearest
+        let words = |num: usize, den: usize| {
+            (self.bitrate_kbps as usize * self.frame_samples() * num + 384 * den) / (768 * den)
         };
-        match self.codec {
-            Codec::Ac3 => ac3::Core::ac3(self.layout, self.bitrate_kbps),
-            Codec::Eac3 { blocks } => ac3::Core {
-                acmod,
-                lfe,
-                kbps: self.bitrate_kbps,
-                frame_bytes: self.frame_bytes(),
-                blocks: blocks.count(),
-                syntax: pack::Syntax::Eac3 { chanmap: None },
-            },
+        match self.layout {
+            Layout::Surround71 => [2 * words(7, 12), 2 * words(5, 12)],
+            _ => [2 * words(1, 1), 0],
+        }
+    }
+
+    /// The cores that code the stream: AC-3 or E-AC-3's independent substream, and 7.1's
+    /// dependent substream. Each picks its coupling range by its share of the rate.
+    pub(crate) fn cores(&self) -> (ac3::Core, Option<ac3::Core>) {
+        let blocks = match self.codec {
+            Codec::Ac3 => return (ac3::Core::ac3(self.layout, self.bitrate_kbps), None),
+            Codec::Eac3 { blocks } => blocks.count(),
+        };
+        let [independent, dependent] = self.syncframe_bytes();
+        let kbps = self.bitrate_kbps;
+        let core = |acmod, lfe, frame_bytes, kbps, chanmap| ac3::Core {
+            acmod,
+            lfe,
+            kbps,
+            frame_bytes,
+            blocks,
+            syntax: pack::Syntax::Eac3 { chanmap },
+        };
+        match self.layout {
+            Layout::Stereo => (core(2, false, independent, kbps, None), None),
+            Layout::Surround51 => (core(7, true, independent, kbps, None), None),
+            Layout::Surround71 => (
+                core(7, true, independent, kbps * 7 / 12, None),
+                Some(core(
+                    6,
+                    false,
+                    dependent,
+                    kbps * 5 / 12,
+                    Some(eac3::CHANMAP_71),
+                )),
+            ),
         }
     }
 
@@ -223,13 +252,48 @@ pub struct Frame<'a> {
     pub pts: u64,
 }
 
+/// Where a coded channel's samples come from in a WAV-order sample.
+#[derive(Clone, Copy)]
+enum Source {
+    Wav(usize),
+    /// A side and a back channel at −3 dB each: 7.1's surround as a 5.1 receiver plays it.
+    Fold(usize, usize),
+}
+
+/// `sample[slot]` clamped to full scale; a non-finite or missing sample reads as 0.
+fn read(sample: &[f32], slot: usize) -> f32 {
+    match sample.get(slot) {
+        Some(v) if v.is_finite() => v.clamp(-1.0, 1.0),
+        _ => 0.0,
+    }
+}
+
+/// Copies `chunk`'s samples of `src` into `dst`.
+fn copy_in(dst: &mut [f32], chunk: &[f32], channels: usize, src: Source) {
+    let samples = chunk.chunks_exact(channels);
+    match src {
+        Source::Wav(slot) => {
+            for (d, s) in dst.iter_mut().zip(samples) {
+                *d = read(s, slot);
+            }
+        }
+        Source::Fold(side, back) => {
+            for (d, s) in dst.iter_mut().zip(samples) {
+                *d = ((read(s, side) + read(s, back)) * FRAC_1_SQRT_2).clamp(-1.0, 1.0);
+            }
+        }
+    }
+}
+
 /// The encoder. Allocates everything in [`Encoder::new`]; after that `push` and `pull` take
 /// no lock, spawn nothing, allocate nothing and never panic.
 pub struct Encoder {
     config: Config,
     core: ac3::Ac3,
-    /// For each coded channel, in bitstream order, its slot in a WAV-order sample.
-    wav_slot: &'static [usize],
+    /// 7.1's dependent substream.
+    dep: Option<ac3::Ac3>,
+    /// For each coded channel of `core`, then of `dep`, in bitstream order, its samples.
+    sources: [&'static [Source]; 2],
     /// Samples of the current frame's span that have arrived.
     fill: usize,
     /// Index of the current frame's first sample.
@@ -237,34 +301,38 @@ pub struct Encoder {
     out: Box<[u8]>,
     out_pts: u64,
     ready: bool,
-    syncframes: [Range<usize>; 1],
+    syncframes: [Range<usize>; 2],
 }
 
 impl Encoder {
-    /// Panics on 7.1, which is not built yet.
+    /// Allocates everything the stream needs. A [`Config`] is valid once built, so every
+    /// one constructs.
     pub fn new(config: Config) -> Result<Encoder, Error> {
-        if config.layout == Layout::Surround71 {
-            todo!("7.1")
-        }
-        let core = ac3::Ac3::new(config.core());
-        let bytes = core.frame_bytes();
+        use Source::{Fold, Wav};
+        let (core, dep) = config.cores();
+        let (core, dep) = (ac3::Ac3::new(core), dep.map(ac3::Ac3::new));
+        let first = core.frame_bytes();
+        let bytes = config.frame_bytes();
         Ok(Encoder {
             config,
             core,
-            wav_slot: match config.layout {
-                Layout::Stereo => &[0, 1],
+            dep,
+            sources: match config.layout {
+                Layout::Stereo => [&[Wav(0), Wav(1)], &[]],
                 // L C R Ls Rs LFE from FL FR FC LFE BL BR
-                _ => &[0, 2, 1, 4, 5, 3],
+                Layout::Surround51 => [&[Wav(0), Wav(2), Wav(1), Wav(4), Wav(5), Wav(3)], &[]],
+                // the fold, then Ls Rs Lrs Rrs from SL SR BL BR
+                Layout::Surround71 => [
+                    &[Wav(0), Wav(2), Wav(1), Fold(6, 4), Fold(7, 5), Wav(3)],
+                    &[Wav(6), Wav(7), Wav(4), Wav(5)],
+                ],
             },
             fill: 0,
             pts: 0,
             out: vec![0; bytes].into_boxed_slice(),
             out_pts: 0,
             ready: false,
-            syncframes: [Range {
-                start: 0,
-                end: bytes,
-            }],
+            syncframes: [0..first, first..bytes],
         })
     }
 
@@ -295,20 +363,26 @@ impl Encoder {
             let (chunk, after) = rest.split_at(take * channels);
             rest = after;
             let fill = self.fill;
-            for (dst, slot) in self.core.pcm_mut().iter_mut().zip(self.wav_slot) {
-                let dst = dst.iter_mut().skip(fill).take(take);
-                for (d, sample) in dst.zip(chunk.chunks_exact(channels)) {
-                    let v = sample.get(*slot).copied().unwrap_or(0.0);
-                    *d = if v.is_finite() {
-                        v.clamp(-1.0, 1.0)
-                    } else {
-                        0.0
-                    };
+            let cores = core::iter::once(&mut self.core).chain(self.dep.as_mut());
+            for (core, sources) in cores.zip(self.sources) {
+                for (dst, src) in core.pcm_mut().iter_mut().zip(sources) {
+                    if let Some(dst) = dst.get_mut(fill..fill + take) {
+                        copy_in(dst, chunk, channels, *src);
+                    }
                 }
             }
             self.fill += take;
             if self.fill == span {
-                self.core.encode(&mut self.out);
+                if let Some((first, second)) = self.out.split_at_mut_checked(self.syncframes[0].end)
+                {
+                    self.core.encode(first);
+                    if let Some(dep) = self.dep.as_mut() {
+                        dep.encode(second);
+                    }
+                }
+                if let Some(dep) = self.dep.as_mut() {
+                    dep.advance();
+                }
                 self.ready = true;
                 self.out_pts = self.pts;
                 self.pts += self.config.frame_samples() as u64;
@@ -339,7 +413,7 @@ impl Encoder {
         self.ready = false;
         Some(Frame {
             bytes: &self.out,
-            syncframes: &self.syncframes,
+            syncframes: &self.syncframes[..1 + usize::from(self.dep.is_some())],
             pts: self.out_pts,
         })
     }
@@ -390,6 +464,34 @@ mod tests {
             1024,
         );
         assert_eq!(six.frame_bytes(), 4096); // frmsiz's ceiling
+    }
+
+    /// 7.1's pair splits the access unit 7:5, each syncframe whole words and within
+    /// `frmsiz`'s 4,096 bytes; every ladder entry builds an encoder.
+    #[test]
+    fn every_ladder_entry_fits_its_syncframes() {
+        let six = Codec::Eac3 {
+            blocks: Blocks::Six,
+        };
+        let c = cfg(six, Layout::Surround71, 1024);
+        assert_eq!(c.syncframe_bytes(), [2390, 1706]); // 1194.7 and 853.3 words
+        assert_eq!(c.frame_bytes(), 4096);
+        for codec in [Blocks::One, Blocks::Two, Blocks::Three, Blocks::Six]
+            .map(|blocks| Codec::Eac3 { blocks })
+            .into_iter()
+            .chain([Codec::Ac3])
+        {
+            for layout in [Layout::Stereo, Layout::Surround51, Layout::Surround71] {
+                for &kbps in Config::bitrates(codec, layout) {
+                    let c = cfg(codec, layout, kbps);
+                    for bytes in c.syncframe_bytes() {
+                        assert!(bytes % 2 == 0 && bytes <= 4096, "{c:?}");
+                    }
+                    let enc = Encoder::new(c).unwrap();
+                    assert_eq!(enc.out.len(), c.frame_bytes());
+                }
+            }
+        }
     }
 
     #[test]

@@ -7,6 +7,11 @@ use crate::bits::{BitWriter, Overflow};
 use crate::exponents::REUSE;
 use crate::pack::{Side, Stream};
 
+/// `chanmap` of 7.1's dependent substream (Table E.1.4, bit 0 the MSB): Ls and Rs, which
+/// replace the independent substream's, and the Lrs/Rrs pair, which extends it (E.2.8.2).
+/// Coded as 2/2 in that order.
+pub(crate) const CHANMAP_71: u16 = 1 << (15 - 3) | 1 << (15 - 4) | 1 << (15 - 6);
+
 /// `numblkscod` of a frame of `blocks` blocks (Table E.1.3).
 fn numblkscod(blocks: usize) -> u32 {
     match blocks {
@@ -124,5 +129,10 @@ mod tests {
         assert_eq!(convexpstr(&[D45, r, r, r, r, r], 1), 31);
         // three: the next frame's block 0 is block 3 of the group
         assert_eq!(convexpstr(&[D25, r, r, r, r, r], 3), 7);
+    }
+
+    #[test]
+    fn the_71_map_names_ls_rs_and_the_rear_pair() {
+        assert_eq!(CHANMAP_71, 0b0001_1010_0000_0000);
     }
 }
