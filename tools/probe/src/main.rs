@@ -1,6 +1,9 @@
 // AC-3 encoder probe: omur or a reference Rust encoder vs ffmpeg's ac3, decoded by ffmpeg.
-// usage: ac3probe gen <out.s16> | enc <in.s16> <out.ac3> <kbps> | cmp <ref.s16> <dec.f32>
+// usage: probe gen <out.s16> | enc <in.s16> <out.ac3> <kbps> | cmp <ref.s16> <dec.f32>
+//        | dump <stream.ac3> [summary]
 // `enc` and `cmp` read `CH` channels (6, or 2 for FL FR); `enc` feeds `CHUNK` samples a push.
+mod dump;
+
 use std::f32::consts::PI;
 use std::time::Instant;
 
@@ -261,6 +264,7 @@ fn main() {
         "gen" => generate(&a[2]),
         "enc" => enc(&a[2], &a[3], a[4].parse().unwrap()),
         "cmp" => cmp(&a[2], &a[3]),
-        _ => panic!("gen | enc | cmp"),
+        "dump" => dump::dump(&a[2], a.get(3).is_some_and(|s| s == "summary")),
+        _ => panic!("gen | enc | cmp | dump"),
     }
 }
